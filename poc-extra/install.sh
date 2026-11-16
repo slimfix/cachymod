@@ -35,16 +35,29 @@ fi
 echo "-> Deploying secure sudoers configuration to $SUDOERS_FILE..."
 
 # Using a strict HEREDOC with no indentations to prevent trailing spaces
-cat << 'EOF' > "$SUDOERS_FILE"
+#cat << 'EOF' > "$SUDOERS_FILE"
 # Prerequisite for Piece-Of-Cake (POC) Custom kernel optimization scripts
-%wheel ALL=(ALL) NOPASSWD: \
-  /usr/bin/sysctl kernel.sched_poc_prefer_idle_smt=0, \
-  /usr/bin/sysctl kernel.sched_poc_prefer_idle_smt=1, \
-  /usr/bin/sysctl kernel.sched_poc_target_sticky=0, \
-  /usr/bin/sysctl kernel.sched_poc_target_sticky=1, \
-  /usr/bin/sysctl kernel.sched_poc_selector=0, \
-  /usr/bin/sysctl kernel.sched_poc_selector=1
-EOF
+#%wheel ALL=(ALL) NOPASSWD: \
+#  /usr/bin/sysctl kernel.sched_poc_prefer_idle_smt=0, \
+#  /usr/bin/sysctl kernel.sched_poc_prefer_idle_smt=1, \
+#  /usr/bin/sysctl kernel.sched_poc_target_sticky=0, \
+#  /usr/bin/sysctl kernel.sched_poc_target_sticky=1, \
+#  /usr/bin/sysctl kernel.sched_poc_selector=0, \
+#  /usr/bin/sysctl kernel.sched_poc_selector=1
+#EOF
+# Deploy hardened sudoers rules
+echo "-> Deploying secure sudoers configuration to $SUDOERS_FILE..."
+
+printf '%s\n' \
+    "# Prerequisite for Piece-Of-Cake (POC) Custom kernel optimization scripts" \
+    "%wheel ALL=(ALL) NOPASSWD: \\" \
+    "  /usr/bin/sysctl kernel.sched_poc_prefer_idle_smt=0, \\" \
+    "  /usr/bin/sysctl kernel.sched_poc_prefer_idle_smt=1, \\" \
+    "  /usr/bin/sysctl kernel.sched_poc_target_sticky=0, \\" \
+    "  /usr/bin/sysctl kernel.sched_poc_target_sticky=1, \\" \
+    "  /usr/bin/sysctl kernel.sched_poc_selector=0, \\" \
+    "  /usr/bin/sysctl kernel.sched_poc_selector=1" \
+    > "$SUDOERS_FILE"
 
 # Set strict read-only permissions for sudoers
 chmod 0440 "$SUDOERS_FILE"
