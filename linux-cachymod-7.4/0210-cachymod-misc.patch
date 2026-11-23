@@ -200,7 +200,7 @@ diff --git a/fs/dcache.c b/fs/dcache.c
 index 66dd1bb830d1..c5282281933f 100644
 --- a/fs/dcache.c
 +++ b/fs/dcache.c
-@@ -74,7 +74,7 @@
+@@ -76,7 +76,7 @@
   * If no ancestor relationship:
   * arbitrary, since it's serialized on rename_lock
   */
@@ -266,7 +266,7 @@ diff --git a/drivers/md/dm-crypt.c b/drivers/md/dm-crypt.c
 index 79704fbc523b..2ccc40954c4c 100644
 --- a/drivers/md/dm-crypt.c
 +++ b/drivers/md/dm-crypt.c
-@@ -3251,6 +3251,9 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+@@ -3259,6 +3259,9 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
  			goto bad;
  	}
  
@@ -352,7 +352,7 @@ diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
 index adec44313772b..1c9db9a246f71 100644
 --- a/net/ipv4/tcp_input.c
 +++ b/net/ipv4/tcp_input.c
-@@ -5417,11 +5417,25 @@ static void tcp_ofo_queue(struct sock *sk)
+@@ -5421,11 +5421,25 @@ static void tcp_ofo_queue(struct sock *sk)
  static bool tcp_prune_ofo_queue(struct sock *sk, const struct sk_buff *in_skb);
  static int tcp_prune_queue(struct sock *sk, const struct sk_buff *in_skb);
  
@@ -401,58 +401,6 @@ index 0cf94c7a2c9c..20450f7a0c92 100644
 -- 
 2.40.2
 
-mm/hugetlb_vmemmap: map the shared tail page writable
-https://lore.kernel.org/lkml/20261028132623.2560146-1-kirill@shutemov.name/
-
-diff --git a/Documentation/mm/vmemmap_dedup.rst b/Documentation/mm/vmemmap_dedup.rst
-index 9fa8642ded48..66d58fbea5b1 100644
---- a/Documentation/mm/vmemmap_dedup.rst
-+++ b/Documentation/mm/vmemmap_dedup.rst
-@@ -130,8 +130,19 @@ pages of ``struct page`` (page 1 to page 7) are tail pages.
- The optimization is only applied when the size of the struct page is a power
- of 2. In this case, all tail pages of the same order are identical. See
- compound_head(). This allows us to remap the tail pages of the vmemmap to a
--shared, read-only page. The head page is also remapped to a new page. This
--allows the original vmemmap pages to be freed.
-+shared page. The head page is also remapped to a new page. This allows the
-+original vmemmap pages to be freed.
-+
-+The shared page is mapped writable. A lockless get of a page reference can
-+read a non-zero refcount before the remap and attempt its atomic update
-+after it. The refcount of a tail page is zero, so the update fails without
-+changing the page. Nothing else may write to the shared page: it is shared
-+by all HugeTLB pages of the same size in the zone, and a stray write would
-+corrupt all of them.
-+
-+HugeTLB pages whose vmemmap is optimized when the memmap is first set up at
-+boot keep a read-only mapping of the shared page. Nothing can do a lockless
-+get on them before they are handed to HugeTLB.
- 
- Here is how things look after remapping::
- 
-diff --git a/mm/hugetlb_vmemmap.c b/mm/hugetlb_vmemmap.c
-index 917db0984143..8e5981888937 100644
---- a/mm/hugetlb_vmemmap.c
-+++ b/mm/hugetlb_vmemmap.c
-@@ -222,10 +222,12 @@ static void vmemmap_remap_pte(pte_t *pte, unsigned long addr,
- 		VM_WARN_ON_ONCE(!PageTail((const struct page *)addr));
- 
- 		/*
--		 * Remap the tail pages as read-only to catch illegal write
--		 * operation to the tail pages.
-+		 * Map the shared tail page writable. A lockless get that read
-+		 * a non-zero refcount before the remap can still do its
-+		 * cmpxchg after it. The refcount is zero, so the cmpxchg
-+		 * fails and leaves the page unchanged.
- 		 */
--		entry = mk_pte(walk->vmemmap_tail, PAGE_KERNEL_RO);
-+		entry = mk_pte(walk->vmemmap_tail, PAGE_KERNEL);
- 	}
- 
- 	list_add(&page->lru, walk->vmemmap_pages);
--- 
-2.54.0
-
 sched/eevdf: Fix vprot across reweighting
 https://lore.kernel.org/all/20261016153721.7843-1-kayracizmeci@gmail.com/
 
@@ -460,7 +408,7 @@ diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
 index 0feec172fd37..fd8902813c9f 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -4900,12 +4900,15 @@ static void reweight_eevdf(struct cfs_rq *cfs_rq, struct sched_entity *se,
+@@ -4906,12 +4906,15 @@ static void reweight_eevdf(struct cfs_rq *cfs_rq, struct sched_entity *se,
  	update_load_set(&se->h_load, weight);
  
  	if (on_rq) {
@@ -478,7 +426,7 @@ index 0feec172fd37..fd8902813c9f 100644
  		if (!curr)
  			__enqueue_entity(cfs_rq, se);
  		cfs_rq->h_nr_queued++;
-@@ -8218,6 +8221,14 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -8229,6 +8232,14 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  	if (!curr) {
  		reweight_eevdf(cfs_rq, se, weight, false);
  		place_entity(cfs_rq, se, flags | ENQUEUE_QUEUED);
@@ -503,7 +451,7 @@ diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
 index 3ebec186f982..3a21ceefcadf 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -15527,6 +15527,15 @@ static void switched_from_fair(struct rq *rq, struct task_struct *p)
+@@ -15564,6 +15564,15 @@ static void switched_from_fair(struct rq *rq, struct task_struct *p)
  	detach_task_cfs_rq(p);
  }
  
@@ -519,7 +467,7 @@ index 3ebec186f982..3a21ceefcadf 100644
  static void switched_to_fair(struct rq *rq, struct task_struct *p)
  {
  	WARN_ON_ONCE(p->se.sched_delayed);
-@@ -15917,6 +15926,7 @@ DEFINE_SCHED_CLASS(fair) = {
+@@ -15954,6 +15963,7 @@ DEFINE_SCHED_CLASS(fair) = {
  	.prio_changed		= prio_changed_fair,
  	.switching_from		= switching_from_fair,
  	.switched_from		= switched_from_fair,
@@ -557,109 +505,90 @@ performing the 'concur' configuration in desktop fluidity.
 
 Signed-off-by: Mario Roy <>
 
-diff -uarp a/kernel/sched/debug.c b/kernel/sched/debug.c
---- a/kernel/sched/debug.c
-+++ b/kernel/sched/debug.c
-@@ -628,7 +628,7 @@ static void debugfs_fair_server_init(voi
- }
+Adopted by CachyOS 7.4-rc2
+https://github.com/CachyOS/linux/commit/ff4cf904d132b8
+
+# diff -uarp a/kernel/sched/debug.c b/kernel/sched/debug.c
+# --- a/kernel/sched/debug.c
+# +++ b/kernel/sched/debug.c
+# @@ -628,7 +628,7 @@ static void debugfs_fair_server_init(voi
+#  }
+#  
+#  #ifdef CONFIG_FAIR_GROUP_SCHED
+# -static int cgroup_mode = 2;
+# +static int cgroup_mode = 3;
+#  
+#  /* See __sched_cgroup_mode_update(). */
+#  static const char *cgroup_mode_str[] = {
+# diff -uarp a/kernel/sched/fair.c b/kernel/sched/fair.c
+# --- a/kernel/sched/fair.c
+# +++ b/kernel/sched/fair.c
+# @@ -5174,7 +5174,7 @@ static long calc_up_shares(struct cfs_rq
+#  	return READ_ONCE(tg->shares);
+#  }
+#  
+# -DEFINE_STATIC_CALL(calc_group_shares, calc_concur_shares);
+# +DEFINE_STATIC_CALL(calc_group_shares, calc_max_shares);
+#  
+#  void __sched_cgroup_mode_update(int mode)
+#  {
+# @@ -5187,10 +5187,10 @@ void __sched_cgroup_mode_update(int mode
+#  		func = &calc_smp_shares;
+#  		break;
+#  	case 2:
+# -	default:
+#  		func = &calc_concur_shares;
+#  		break;
+#  	case 3:
+# +	default:
+#  		func = &calc_max_shares;
+#  		break;
+#  	case 4:
+# -- 
+# 2.53.0
+
+Sync CACHY: drop unused modulo scheduling
+https://github.com/CachyOS/linux/commit/773080018867bfeff124768090ea991a6e070cd2
+
+diff --git a/Makefile b/Makefile
+index 2f74bb00be6551..6a512a4d45d28f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -946,12 +946,6 @@ KBUILD_CFLAGS += -Os
+ KBUILD_RUSTFLAGS += -Copt-level=s
+ endif
  
- #ifdef CONFIG_FAIR_GROUP_SCHED
--static int cgroup_mode = 2;
-+static int cgroup_mode = 3;
- 
- /* See __sched_cgroup_mode_update(). */
- static const char *cgroup_mode_str[] = {
-diff -uarp a/kernel/sched/fair.c b/kernel/sched/fair.c
---- a/kernel/sched/fair.c
-+++ b/kernel/sched/fair.c
-@@ -5174,7 +5174,7 @@ static long calc_up_shares(struct cfs_rq
- 	return READ_ONCE(tg->shares);
- }
- 
--DEFINE_STATIC_CALL(calc_group_shares, calc_concur_shares);
-+DEFINE_STATIC_CALL(calc_group_shares, calc_max_shares);
- 
- void __sched_cgroup_mode_update(int mode)
- {
-@@ -5187,10 +5187,10 @@ void __sched_cgroup_mode_update(int mode
- 		func = &calc_smp_shares;
- 		break;
- 	case 2:
--	default:
- 		func = &calc_concur_shares;
- 		break;
- 	case 3:
-+	default:
- 		func = &calc_max_shares;
- 		break;
- 	case 4:
+-# Perform swing modulo scheduling immediately before the first scheduling pass.
+-# This pass looks at innermost loops and reorders their instructions by
+-# overlapping different iterations.
+-KBUILD_CFLAGS += $(call cc-option,-fmodulo-sched -fmodulo-sched-allow-regmoves -fivopts)
+-KBUILD_CFLAGS += $(call cc-option,-mllvm -enable-pipeliner)
+-
+ # Always set `debug-assertions` and `overflow-checks` because their default
+ # depends on `opt-level` and `debug-assertions`, respectively.
+ KBUILD_RUSTFLAGS += -Cdebug-assertions=$(if $(CONFIG_RUST_DEBUG_ASSERTIONS),y,n)
 -- 
 2.53.0
 
-From Stefan Kerkmann
-https://lore.kernel.org/all/47f8c30b-e326-4ff0-a2bc-5683209a9e2d@pengutronix.de/
+Sync CACHY: kbuild: revert resolve_btfids from PKGBUILD
+https://github.com/CachyOS/linux/commit/9b3640276f8dd187487aa2c4e9bc8ecc338df7b1
 
-commit a339671db64b ("vdso: Switch get/put_unaligned() from packed struct to
-memcpy()"), which landed in 7.0, causes a performance regression on an NXP
-i.MX25 (ARMv5TE) SoC.
-
-Revert vdso: Switch get/put_unaligned() from packed struct to memcpy()
-https://github.com/CachyOS/linux/commit/a339671db64b
-
-diff --git a/include/vdso/unaligned.h b/include/vdso/unaligned.h
-index ff0c06b6513eff..9076483c9fbbd0 100644
---- a/include/vdso/unaligned.h
-+++ b/include/vdso/unaligned.h
-@@ -2,43 +2,14 @@
- #ifndef __VDSO_UNALIGNED_H
- #define __VDSO_UNALIGNED_H
+diff --git a/scripts/package/PKGBUILD b/scripts/package/PKGBUILD
+index e187908d3f1e6a..66e4b6a37783c2 100644
+--- a/scripts/package/PKGBUILD
++++ b/scripts/package/PKGBUILD
+@@ -90,11 +90,6 @@ _package-headers() {
+ 		"${srctree}/scripts/package/install-extmod-build" "${builddir}"
+ 	fi
  
--#include <linux/compiler_types.h>
+-	# required when DEBUG_INFO_BTF_MODULES is enabled
+-	if [ -f tools/bpf/resolve_btfids/resolve_btfids ]; then
+-		install -Dt "$builddir/tools/bpf/resolve_btfids" tools/bpf/resolve_btfids/resolve_btfids
+-	fi
 -
--/**
-- * __get_unaligned_t - read an unaligned value from memory.
-- * @type:	the type to load from the pointer.
-- * @ptr:	the pointer to load from.
-- *
-- * Use memcpy to affect an unaligned type sized load avoiding undefined behavior
-- * from approaches like type punning that require -fno-strict-aliasing in order
-- * to be correct. As type may be const, use __unqual_scalar_typeof to map to a
-- * non-const type - you can't memcpy into a const type. The
-- * __get_unaligned_ctrl_type gives __unqual_scalar_typeof its required
-- * expression rather than type, a pointer is used to avoid warnings about mixing
-- * the use of 0 and NULL. The void* cast silences ubsan warnings.
-- */
--#define __get_unaligned_t(type, ptr) ({					\
--	type *__get_unaligned_ctrl_type __always_unused = NULL;		\
--	__unqual_scalar_typeof(*__get_unaligned_ctrl_type) __get_unaligned_val; \
--	__builtin_memcpy(&__get_unaligned_val, (void *)(ptr),		\
--			 sizeof(__get_unaligned_val));			\
--	__get_unaligned_val;						\
-+#define __get_unaligned_t(type, ptr) ({							\
-+	const struct { type x; } __packed * __get_pptr = (typeof(__get_pptr))(ptr);	\
-+	__get_pptr->x;									\
- })
- 
--/**
-- * __put_unaligned_t - write an unaligned value to memory.
-- * @type:	the type of the value to store.
-- * @val:	the value to store.
-- * @ptr:	the pointer to store to.
-- *
-- * Use memcpy to affect an unaligned type sized store avoiding undefined
-- * behavior from approaches like type punning that require -fno-strict-aliasing
-- * in order to be correct. The void* cast silences ubsan warnings.
-- */
--#define __put_unaligned_t(type, val, ptr) do {				\
--	type __put_unaligned_val = (val);				\
--	__builtin_memcpy((void *)(ptr), &__put_unaligned_val,		\
--			 sizeof(__put_unaligned_val));			\
-+#define __put_unaligned_t(type, val, ptr) do {						\
-+	struct { type x; } __packed * __put_pptr = (typeof(__put_pptr))(ptr);		\
-+	__put_pptr->x = (val);								\
- } while (0)
- 
- #endif /* __VDSO_UNALIGNED_H */
+ 	echo "Installing System.map and config..."
+ 	mkdir -p "${builddir}"
+ 	cp System.map "${builddir}/System.map"
 -- 
-2.55.0
+2.53.0
 

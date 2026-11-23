@@ -6,7 +6,7 @@
 # Set these variables to ANYTHING that is not null or choose proper variable to enable them
 
 # Enable the official BORE scheduler patch
-: ${_use_bore:=no}
+: ${_use_bore:=yes}
 
 # Select CPU scheduler { eevdf, rt }
 # eevdf: EEVDF Scheduler (use with the linux-cgroup-always repo, optional)
@@ -43,7 +43,7 @@
 #
 # More at this wiki page ---> https://wiki.archlinux.org/index.php/Modprobed-db
 # Use this option together with _localmodcfg_minimal for diet kernel build.
-: ${_localmodcfg:=no}
+: ${_localmodcfg:=yes}
 
 # The localmod db name (e.g. modprobed.db) or full path
 # The list of used modules can be found in ~/.local/share/modprobed-db/
@@ -52,10 +52,10 @@
 
 # Include the modules in minimal-modprobed.db (use with _localmodcfg)
 # This is the diet db from Linux-tkg
-: ${_localmodcfg_minimal:=no}
+: ${_localmodcfg_minimal:=yes}
 
 # Enable TCP_CONG_BBR3
-: ${_tcp_bbr3:=no}
+: ${_tcp_bbr3:=yes}
 
 # Running tick rate { 1000, 800, 750, 625, 600, 500 }
 # Select 1000 if your machine has less than or equal to 16 CPUs.
@@ -80,7 +80,7 @@
 # { westmere, haswell, skylake, raptorlake, meteorlake, k10, zen2, zen3, zen4, zen5 }
 # For the "other" selection, set the processor UARCH via custom.sh or makenconfig
 # Example custom.sh line: scripts/config -d GENERIC_CPU -e MTIGERLAKE
-: ${_processor_opt:=native}
+: ${_processor_opt:=zen3}
 
 # Builds the r8125 module and package it into its own package
 # Replaces requirement for r8125-dkms
@@ -98,7 +98,23 @@
 # clang: Build kernel with clang, auto suffix "-clang"
 # thin:  Build kernel with clang thin-LTO, auto suffix "-lto"
 # full:  Build kernel with clang full-LTO; auto suffix "-lto"
-: ${_buildtype:=clang}
+: ${_buildtype:=thin}
+
+# Enable AUTOFDO_CLANG for the first compilation,
+#  to create a kernel, which can be used for profiling
+# Workflow:
+#  https://cachyos.org/blog/2411-kernel-autofdo/
+#  https://docs.kernel.org/dev-tools/autofdo.html
+# Steps:
+# 1. Compile Kernel with _build_debug=yes _buildtype=thin and _autofdo=yes
+# 2. Boot the kernel in QEMU or on your system, see Workload
+# 3. Profile the kernel and convert the profile, see Generating...
+# 4. Put the profile into the source dir
+# 5. Build kernel again with _autofdo_profile_name specified
+: ${_autofdo:=no}
+
+# Name for the AutoFDO profile e.g. cachymod.afdo (can be any name)
+: ${_autofdo_profile_name:=}
 
 
 # ATTENTION: Do not modify after this line
@@ -117,6 +133,11 @@ if [[ "$_hugepage" = "auto" ]]; then
     [ "$_cpusched"  = "rt" ] && _hugepage="madvise"
 fi
 
+if [[ "$_buildtype" =~ ^(gcc)$ ]]; then
+    _autofdo="no"
+    _autofdo_profile_name=""
+fi
+
 [[ "$_buildtype" =~ ^(thin|full)$ ]] \
     && buildtype="lto" || buildtype="$_buildtype"
 
@@ -132,7 +153,7 @@ _pkgsuffix=cachymod
 _major=7.4
 _minor=0
 _tagrel=1
-_rcver="rc1"
+_rcver="rc3"
 pkgver=${_major}.${_rcver}
 
 pkgdesc='CachyMod Linux Kernel with other patches and improvements'
@@ -162,6 +183,7 @@ source=(
     "0000-assoc-array-fixes.patch"
 
     # CachyOS
+    "0001-acpi-call.patch"
     "0001-rt-i915.patch"
 
     # XanMod
@@ -172,7 +194,6 @@ source=(
     "0110-rt-lift-thp-restriction.patch"
     "0200-clearlinux-extras.patch"
     "0210-cachymod-misc.patch"
-    "0230-nap-0.6.6.patch"
     "0260-fair-update-cachy-mods.patch"
     "0280-prefer-idle-core.patch"
     "0290-7.4-rc1-poc-selector-v3.0.1.patch"
@@ -194,7 +215,9 @@ fi
 
 # LLVM makedepends
 if [[ "$buildtype" =~ (lto|clang) ]]; then
-    makedepends+=(clang llvm lld)
+    # pahole needs the --lang_exclude fix for merged LTO CUs to generate
+    # BTF for Rust modules
+    makedepends+=(clang llvm lld 'pahole>=1:1.32-2')
     source+=("dkms-clang.patch")
 
     # Skip the flags-clang patch with older CPUs
@@ -227,6 +250,15 @@ else
 fi
 
 _die() { error "$@" ; exit 1; }
+
+# Use generated AutoFDO Profile
+if [[ "$_autofdo" =~ ^(yes|y|1)$ && -n "$_autofdo_profile_name" ]]; then
+    if [ -e "$_autofdo_profile_name" ]; then
+        source+=("$_autofdo_profile_name")
+    else
+        _die "Failed to find file ${_autofdo_profile_name}"
+    fi
+fi
 
 if [[ "$_build_r8125" =~ ^(yes|y|1)$ ]]; then
     source+=("git+https://github.com/aravance/r8125.git")
@@ -455,15 +487,15 @@ prepare() {
     ### Enable bbr3
     if [[ "$_tcp_bbr3" =~ ^(yes|y|1)$ ]]; then
         echo "Disabling TCP_CONG_CUBIC..."
-        scripts/config -m TCP_CONG_CUBIC \
-            -d DEFAULT_CUBIC \
-            -e TCP_CONG_BBR \
-            -e DEFAULT_BBR \
+        scripts/config \
+            -m TCP_CONG_CUBIC -d DEFAULT_CUBIC \
+            -e TCP_CONG_BBR -e DEFAULT_BBR \
             --set-str DEFAULT_TCP_CONG bbr \
             -m NET_SCH_FQ_CODEL \
             -e NET_SCH_FQ \
             -d CONFIG_DEFAULT_FQ_CODEL \
-            -e CONFIG_DEFAULT_FQ
+            -e CONFIG_DEFAULT_FQ \
+            --set-str DEFAULT_NET_SCH "fq"
     fi
 
     ### Select THP
@@ -495,6 +527,15 @@ prepare() {
             -m ZOTAC_ZONE_PLATFORM \
             -m EXTCON_STEAMDECK \
             -m HID_MSI
+    fi
+
+    ### Enable Clang AutoFDO
+    if [[ "$_autofdo" =~ ^(yes|y|1)$ ]]; then
+        scripts/config -e AUTOFDO_CLANG
+    fi
+    if [[ "$_autofdo" =~ ^(yes|y|1)$ && -n "$_autofdo_profile_name" ]]; then
+        echo "The AutoFDO profile has been found..."
+        BUILD_FLAGS+=(CLANG_AUTOFDO_PROFILE="${srcdir}/${_autofdo_profile_name}")
     fi
 
     ### Run the config.sh script for kernel tuning
@@ -567,7 +608,10 @@ prepare() {
         # Re-apply the bbr3 module configs
         if [[ "$_tcp_bbr3" =~ ^(yes|y|1)$ ]]; then
            echo "Re-enabling the bbr3 module configs..."
-           scripts/config -m TCP_CONG_CUBIC -m NET_SCH_FQ_CODEL
+           scripts/config \
+              -m TCP_CONG_CUBIC -m NET_SCH_FQ_CODEL \
+              -d CONFIG_DEFAULT_FQ_CODEL \
+              -e CONFIG_DEFAULT_FQ
         fi
 
         # Re-apply the handheld module configs

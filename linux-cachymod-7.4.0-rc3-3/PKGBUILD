@@ -1,0 +1,937 @@
+# PKGBUILD originated from CachyOS, modified for CachyMod.
+# https://github.com/marioroy/cachymod
+# https://wiki.archlinux.org/title/PKGBUILD
+
+### BUILD OPTIONS
+# Set these variables to ANYTHING that is not null or choose proper variable to enable them
+
+# Enable the official BORE scheduler patch
+: ${_use_bore:=yeso}
+
+# Select CPU scheduler { eevdf, rt }
+# eevdf: EEVDF Scheduler (use with the linux-cgroup-always repo, optional)
+# rt:    EEVDF Scheduler with real-time preemption enabled
+: ${_cpusched:=eevdf}
+
+# Custom kernel suffix, specify uniquely if building multiple CachyMod kernels
+# E.g. { blank value, 74, 74-rt }
+# Or set to "auto" for automatic suffix { gcc, clang, lto }
+# Or set to blank value for no kernel suffix
+: ${_kernel_suffix:=}
+
+# Prevent AVX2 floating-point instructions. (Clear and XanMod default)
+: ${_prevent_avx2:=no}
+
+# Tweak kernel options prior to a build via nconfig or xconfig
+: ${_makenconfig:=no}
+: ${_makexconfig:=no}
+
+# Transparent Hugepages
+# 'auto' - default always for non-RT or madvise for RT
+# 'always'  - always enable THP
+# 'madvise' - madvise, prevent applications from allocating more memory resources than necessary
+# More infos here:
+# https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/performance_tuning_guide/sect-red_hat_enterprise_linux-performance_tuning_guide-configuring_transparent_huge_pages
+: ${_hugepage:=auto}
+
+# Compile ONLY used modules to VASTLY reduce the number of modules built
+# and the build time.
+#
+# To keep track of which modules are needed for your specific system/hardware,
+# give module_db script a try: https://aur.archlinux.org/packages/modprobed-db
+# This PKGBUILD read the database kept if it exists
+#
+# More at this wiki page ---> https://wiki.archlinux.org/index.php/Modprobed-db
+# Use this option together with _localmodcfg_minimal for diet kernel build.
+: ${_localmodcfg:=yes}
+
+# The localmod db name (e.g. modprobed.db) or full path
+# The list of used modules can be found in ~/.local/share/modprobed-db/
+# or the ~/.config/ folder
+: ${_localmodcfg_path:=modprobed.db}
+
+# Include the modules in minimal-modprobed.db (use with _localmodcfg)
+# This is the diet db from Linux-tkg
+: ${_localmodcfg_minimal:=yes}
+
+# Enable TCP_CONG_BBR3
+: ${_tcp_bbr3:=yes}
+
+# Running tick rate { 1000, 800, 750, 625, 600, 500 }
+# Select 1000 if your machine has less than or equal to 16 CPUs.
+# Select 800 if you want a balance between latency and performance,
+# with more focus on latency. Otherwise, the best value is a mystery.
+# Select 625 or 500 if you want to minimize battery consumption.
+: ${_HZ_ticks:=1000}
+
+# Choose between full or idle tick type
+# Full tickless can give higher performances in various cases but, depending on
+# hardware, lower consistency. Idle (without rcu_nocb_cpu) may reduce stutters.
+: ${_ticktype:=idle}
+
+# Select default preemption { full, lazy }
+# Preemption can be changed dynamically at runtime.
+# Select "full" for low-latency desktop.
+# Select "lazy" for slightly better throughput.
+: ${_preempt:=full}
+
+# Select CPU compiler optimization
+# { generic, generic_v1, generic_v2, generic_v3, generic_v4, native, other }
+# { westmere, haswell, skylake, raptorlake, meteorlake, k10, zen2, zen3, zen4, zen5 }
+# For the "other" selection, set the processor UARCH via custom.sh or makenconfig
+# Example custom.sh line: scripts/config -d GENERIC_CPU -e MTIGERLAKE
+: ${_processor_opt:=zen3}
+
+# Builds the r8125 module and package it into its own package
+# Replaces requirement for r8125-dkms
+: ${_build_r8125:=no}
+
+# Build a debug package with non-stripped vmlinux
+: ${_build_debug:=no}
+
+# Select build type { gcc, clang, thin, full }
+# ATTENTION: Selecting the full buildtype consumes more memory,
+# not recommended if you have less than 24GB of RAM. The single
+# thread for linking can reach up to 20GB of memory utilization.
+# Auto suffix depends on the kernel_suffix option set to auto.
+# gcc:   Build kernel with gcc, auto suffix "-gcc"
+# clang: Build kernel with clang, auto suffix "-clang"
+# thin:  Build kernel with clang thin-LTO, auto suffix "-lto"
+# full:  Build kernel with clang full-LTO; auto suffix "-lto"
+: ${_buildtype:=thin}
+
+# Enable AUTOFDO_CLANG for the first compilation,
+#  to create a kernel, which can be used for profiling
+# Workflow:
+#  https://cachyos.org/blog/2411-kernel-autofdo/
+#  https://docs.kernel.org/dev-tools/autofdo.html
+# Steps:
+# 1. Compile Kernel with _build_debug=yes _buildtype=thin and _autofdo=yes
+# 2. Boot the kernel in QEMU or on your system, see Workload
+# 3. Profile the kernel and convert the profile, see Generating...
+# 4. Put the profile into the source dir
+# 5. Build kernel again with _autofdo_profile_name specified
+: ${_autofdo:=no}
+
+# Name for the AutoFDO profile e.g. cachymod.afdo (can be any name)
+: ${_autofdo_profile_name:=}
+
+
+# ATTENTION: Do not modify after this line
+
+if [ -x /usr/bin/tput ] && tput setaf 1 >&/dev/null; then
+    # We have color support; assume it's compliant with Ecma-48 (ISO/IEC-6429)
+    _CYAN='\033[00;36m' _NC='\033[00m' # no color
+    # Respect the makepkg !color option if set in /etc/makepkg.conf
+    [[ "${BUILDENV[*]}" = *"!color"* ]] && _CYAN= _NC=
+else
+    _CYAN= _NC=
+fi
+
+if [[ "$_hugepage" = "auto" ]]; then
+    [ "$_cpusched" != "rt" ] && _hugepage="always"
+    [ "$_cpusched"  = "rt" ] && _hugepage="madvise"
+fi
+
+if [[ "$_buildtype" =~ ^(gcc)$ ]]; then
+    _autofdo="no"
+    _autofdo_profile_name=""
+fi
+
+[[ "$_buildtype" =~ ^(thin|full)$ ]] \
+    && buildtype="lto" || buildtype="$_buildtype"
+
+if [ "$_kernel_suffix" = "auto" ]; then
+    kernel_suffix="$buildtype"
+elif [ -n "$_kernel_suffix" ]; then
+    kernel_suffix="$_kernel_suffix"
+else
+    kernel_suffix=""
+fi
+
+_pkgsuffix=cachymod
+_major=7.4
+_minor=0
+_tagrel=1
+_rcver="rc3"
+pkgver=${_major}.${_rcver}
+
+pkgdesc='CachyMod Linux Kernel with other patches and improvements'
+pkgrel=3
+#_srcname=cachyos-${_major}.${_minor}-${_tagrel}
+_srcname=cachyos-${_major}-${_rcver}-${_tagrel}
+_kernver="$pkgver-$pkgrel"
+_kernuname="${pkgver}-${_pkgsuffix}"
+arch=('x86_64')
+url="https://github.com/marioroy/cachymod"
+license=('GPL-2.0-only')
+options=('!strip' '!debug' '!lto')
+
+makedepends=(
+    bc binutils cpio gettext glibc libelf libgcc openssl
+    pahole perl python tar xxhash xz zlib zstd
+    rust rust-bindgen rust-src
+)
+
+source=(
+    "https://github.com/CachyOS/linux/releases/download/${_srcname}/${_srcname}.tar.gz"
+    "config"
+    "config.sh"
+    "minimal-modprobed.db"  # used if _localmodcfg=yes and _localmodcfg_minimal=yes
+
+    # Revert the CachyOS 7.4-rc3 mglru-fg branch
+    "0000-revert-mglru-fg-branch.patch"
+
+    # assoc_array: clean up library
+    "0000-assoc-array-fixes.patch"
+
+    # CachyOS
+    "0001-acpi-call.patch"
+    "0001-rt-i915.patch"
+
+    # XanMod
+    "0002-x86-kconfig-uarches.patch"
+
+    # CachyMod
+    "0100-kconfig-add-800Hz.patch"
+    "0110-rt-lift-thp-restriction.patch"
+    "0200-clearlinux-extras.patch"
+    "0210-cachymod-misc.patch"
+    "0260-fair-update-cachy-mods.patch"
+    "0280-prefer-idle-core.patch"
+    "0290-7.4-rc1-poc-selector-v3.0.1.patch"
+    "0001-7.4-rc3-lru_cast-v0.2.11.patch"
+    "0001-7.3.0-rc5-cambyses-v0.7.2.patch"
+
+    # Clear Linux default, applied if _prevent_avx2=yes
+    "0300-x86-prevent-avx2-vector.patch"
+
+    # The credit-sleep feature is applied unless detected BORE patch
+    "0350-bore-credit-sleep-7.0.1.patch"
+
+    # This revert is applied only if detected a BORE patch
+    "0360-fair-revert-cachy-mods.patch"
+)
+
+# Use BORE
+if [[ "$_use_bore" =~ ^(yes|y|1)$ ]]; then
+    source+=("0370-linux7.4-rc1-bore--7.0.1.patch")
+fi
+
+# LLVM makedepends
+if [[ "$buildtype" =~ (lto|clang) ]]; then
+    # pahole needs the --lang_exclude fix for merged LTO CUs to generate
+    # BTF for Rust modules
+    makedepends+=(clang llvm lld 'pahole>=1:1.32-2')
+    source+=("dkms-clang.patch")
+
+    # Skip the flags-clang patch with older CPUs
+    if [[ $(nproc) -gt 4 && -n $(lscpu 2>/dev/null | grep avx2) ]]; then
+        [[ -z "$_build_debug" || "$_build_debug" =~ ^(no|n|0)$ ]] && \
+            source+=("flags-clang.patch")
+    fi
+
+    BUILD_FLAGS=(CC=clang LD=ld.lld LLVM_IAS=1)
+    CLANG_BIN=$(which clang) ; CLANG_BIN="${CLANG_BIN%clang}"
+
+    if [[ "$CLANG_BIN" != "/usr/bin/" && -x "${CLANG_BIN%/}/llvm-strip" ]]; then
+        BUILD_FLAGS+=(
+            LLVM="$CLANG_BIN"
+            LIBCLANG_PATH="${CLANG_BIN%/}/../lib"
+            AR=llvm-ar
+            AS=llvm-as
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            RANLIB=llvm-ranlib
+            READELF=llvm-readelf
+            STRIP=llvm-strip
+        )
+    else
+        BUILD_FLAGS+=(LLVM=1)
+    fi
+else
+    BUILD_FLAGS=(CC=gcc)
+fi
+
+_die() { error "$@" ; exit 1; }
+
+# Use generated AutoFDO Profile
+if [[ "$_autofdo" =~ ^(yes|y|1)$ && -n "$_autofdo_profile_name" ]]; then
+    if [ -e "$_autofdo_profile_name" ]; then
+        source+=("$_autofdo_profile_name")
+    else
+        _die "Failed to find file ${_autofdo_profile_name}"
+    fi
+fi
+
+if [[ "$_build_r8125" =~ ^(yes|y|1)$ ]]; then
+    source+=("git+https://github.com/aravance/r8125.git")
+fi
+
+# Append extra sources in build.sh
+[ -n "$_extra_patch_or_url0" ] && source+=("$_extra_patch_or_url0")
+[ -n "$_extra_patch_or_url1" ] && source+=("$_extra_patch_or_url1")
+[ -n "$_extra_patch_or_url2" ] && source+=("$_extra_patch_or_url2")
+[ -n "$_extra_patch_or_url3" ] && source+=("$_extra_patch_or_url3")
+[ -n "$_extra_patch_or_url4" ] && source+=("$_extra_patch_or_url4")
+[ -n "$_extra_patch_or_url5" ] && source+=("$_extra_patch_or_url5")
+[ -n "$_extra_patch_or_url6" ] && source+=("$_extra_patch_or_url6")
+[ -n "$_extra_patch_or_url7" ] && source+=("$_extra_patch_or_url7")
+[ -n "$_extra_patch_or_url8" ] && source+=("$_extra_patch_or_url8")
+[ -n "$_extra_patch_or_url9" ] && source+=("$_extra_patch_or_url9")
+
+build_bore=0
+{
+    local src
+    for src in "${source[@]}"; do
+        if [[ $src = *-bore* && $src != 0350-bore-credit-sleep* ]]; then
+            [[ "$_cpusched" =~ ^(eevdf|rt)$ ]] && build_bore=1
+            break
+        fi
+    done
+}
+
+build_handheld=0
+{
+    local src
+    for src in "${source[@]}"; do
+        if [[ $src = *-handheld* ]]; then
+            [[ "$_cpusched" =~ ^(eevdf|rt)$ ]] && build_handheld=1
+            break
+        fi
+    done
+}
+
+build_poc=0
+{
+    local src
+    for src in "${source[@]}"; do
+        if [[ $src = *-poc-selector* && $src != 0290-poc-selector* ]]; then
+            [[ "$_cpusched" =~ ^(eevdf|rt)$ ]] && build_poc=1
+            break
+        fi
+    done
+}
+
+if [ -s "custom.sh" ]; then
+    custom_script="$(pwd)/custom.sh"
+else
+    custom_script=""
+fi
+
+pkgbase="linux-$_pkgsuffix"
+if [ -n "$kernel_suffix" ]; then
+    pkgbase="${pkgbase}-${kernel_suffix}"
+fi
+
+export KBUILD_BUILD_HOST=cachyos
+export KBUILD_BUILD_USER="$pkgbase"
+export KBUILD_BUILD_TIMESTAMP="$(date -Ru${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EPOCH})"
+
+prepare() {
+    cd "$_srcname"
+
+    echo "Setting version..."
+    echo "-$pkgrel" > localversion.10-pkgrel
+    echo "${pkgbase#linux}" > localversion.20-pkgname
+
+    local src
+    for src in "${source[@]}"; do
+        src="${src%%::*}"
+        src="${src##*/}"
+        src="${src%.zst}"
+        [[ $src = *.patch ]] || continue
+        if [[ $src = *-prevent-avx2* ]]; then
+            [[ "$_prevent_avx2" =~ ^(yes|y|1)$ ]] || continue
+        fi
+        if [[ $src = 0280-prefer-idle-core* ]]; then
+            [[ "$build_poc" -eq 1 ]] && continue
+        fi
+        if [[ $src = 0290-poc-selector* ]]; then
+            [[ "$build_poc" -eq 1 ]] && continue
+        fi
+        if [[ $src = 0350-bore-credit-sleep* ]]; then
+            [[ "$build_bore" -eq 1 ]] && continue
+        fi
+        if [[ $src = *-revert-cachy-mods.patch ]]; then
+            [[ "$build_bore" -eq 0 ]] && continue
+        fi
+        echo -e "${_CYAN}Applying patch $src...${_NC}"
+        patch -Np1 < "../$src"
+    done
+
+    echo -e "${_CYAN}Setting config...${_NC}"
+    cp ../config .config
+
+    ### Remove RT version file
+    rm -f localversion-rt
+
+    ### Select CPU optimization (default Generic)
+    if [ -n "$_processor_opt" ]; then
+        MARCH="${_processor_opt^^}"
+        if [ "$MARCH" = "OTHER" ]; then
+            echo "Selecting CPU (MARCH) : OTHER via custom.sh or makenconfig"
+        elif [ "$MARCH" != "GENERIC" ]; then
+            if [[ "$MARCH" =~ GENERIC_V[1-4] ]]; then
+                X86_64_LEVEL="${MARCH//GENERIC_V}"
+                echo "Selecting CPU (X86_64_VERSION) : ${X86_64_LEVEL}"
+                scripts/config -e GENERIC_CPU -d MZEN4 -d X86_NATIVE_CPU
+                scripts/config --set-val X86_64_VERSION "${X86_64_LEVEL}"
+            elif [ "$MARCH" = "NATIVE" ]; then
+                echo "Selecting CPU (MARCH) : ${MARCH}"
+                scripts/config -d GENERIC_CPU -d MZEN4 -e X86_NATIVE_CPU
+            else
+                echo "Selecting CPU (MARCH) : ${MARCH}"
+                scripts/config -d GENERIC_CPU -e "M${MARCH}" -d X86_NATIVE_CPU
+            fi
+        fi
+    else
+        echo "Selecting CPU (MARCH) : NATIVE"
+        scripts/config -d GENERIC_CPU -d MZEN4 -e X86_NATIVE_CPU
+    fi
+
+    echo "Disabling Cache aware load balancer..."
+    echo "Prevents multi-CCD thread choking and gaming regressions."
+    scripts/config -d SCHED_CACHE
+
+    echo "Enabling CachyOS config..."
+    scripts/config -e CACHY
+
+    ### Selecting the CPU scheduler
+    case "$_cpusched" in
+        eevdf|rt) ;;
+        *) _die "The _cpusched value '$_cpusched' is invalid. Choose the correct one again.";;
+    esac
+
+    echo "Selecting '${_cpusched^^}' CPU scheduler..."
+
+    if [ "$build_bore" -eq 1 ]; then
+        echo "Enabling BORE config..."
+        scripts/config -e SCHED_BORE --set-val MIN_BASE_SLICE_NS 1600000
+    fi
+
+    ### Select build type
+    case "$_buildtype" in
+        full)
+            scripts/config -e LTO -e LTO_CLANG -e ARCH_SUPPORTS_LTO_CLANG -e ARCH_SUPPORTS_LTO_CLANG_THIN -e HAS_LTO_CLANG -d LTO_NONE -e LTO_CLANG_FULL -d LTO_CLANG_THIN -d LTO_CLANG_THIN_DIST -e HAVE_GCC_PLUGINS
+            ;;
+        thin)
+            scripts/config -e LTO -e LTO_CLANG -e ARCH_SUPPORTS_LTO_CLANG -e ARCH_SUPPORTS_LTO_CLANG_THIN -e HAS_LTO_CLANG -d LTO_NONE -d LTO_CLANG_FULL -e LTO_CLANG_THIN -d LTO_CLANG_THIN_DIST -e HAVE_GCC_PLUGINS
+            ;;
+        clang)
+            scripts/config -e LTO -e LTO_CLANG -e ARCH_SUPPORTS_LTO_CLANG -e ARCH_SUPPORTS_LTO_CLANG_THIN -e HAS_LTO_CLANG -e LTO_NONE -d LTO_CLANG_FULL -d LTO_CLANG_THIN -d LTO_CLANG_THIN_DIST -e HAVE_GCC_PLUGINS
+            ;;
+        gcc)
+            scripts/config -e LTO_NONE
+            ;;
+        *)
+            _die "The _buildtype value '$_buildtype' is invalid. Choose the correct one again."
+    esac
+
+    if [ "$buildtype" = "lto" ]; then
+        echo "Selecting 'clang' compiler, '$_buildtype' LLVM level..."
+    else
+        echo "Selecting '$_buildtype' compiler, no LTO..."
+    fi
+
+    ### Select tick rate
+    case "$_HZ_ticks" in
+        1000|800|750|625|600|500)
+            scripts/config -d HZ_800 -d HZ_625 -d HZ_300 -e "HZ_${_HZ_ticks}" --set-val HZ "${_HZ_ticks}";;
+        *)
+            _die "The _HZ_ticks value '$_HZ_ticks' is invalid. Choose the correct one again."
+    esac
+
+    echo "Setting tick rate to ${_HZ_ticks}Hz..."
+
+    ### Select tick type
+    case "$_ticktype" in
+        full)
+            scripts/config -d HZ_PERIODIC -d NO_HZ_IDLE -d CONTEXT_TRACKING_FORCE -e NO_HZ_FULL_NODEF -e NO_HZ_FULL -e NO_HZ -e NO_HZ_COMMON -e CONTEXT_TRACKING
+            ;;
+        idle)
+            scripts/config -d HZ_PERIODIC -d NO_HZ_FULL -e NO_HZ_IDLE -e NO_HZ -e NO_HZ_COMMON
+            scripts/config -d RCU_NOCB_CPU -d TICK_CPU_ACCOUNTING -e VIRT_CPU_ACCOUNTING_GEN
+            ;;
+        *)
+            _die "The _ticktype value '$_ticktype' is invalid. Choose the correct one again."
+    esac
+
+    echo "Selecting '$_ticktype' tick type..."
+
+    ### Select preempt type
+    case "$_preempt" in
+        full)
+            scripts/config -e PREEMPT_DYNAMIC -e PREEMPT -d PREEMPT_LAZY;;
+        lazy)
+            scripts/config -e PREEMPT_DYNAMIC -d PREEMPT -e PREEMPT_LAZY;;
+        *)
+            _die "The _preempt value '$_preempt' is invalid. Choose the correct one again."
+    esac
+
+    echo "Selecting '$_preempt' preempt type..."
+
+    if [ "$_cpusched" = "rt" ]; then
+        echo "Enabling real-time preemption, as well..."
+        scripts/config -e PREEMPT_RT
+        scripts/config -e DRM_MGAG200_DISABLE_WRITECOMBINE
+    else
+        scripts/config -d PREEMPT_RT
+    fi
+
+    ### Mindfulness for the CPU L1/L2 I-instruction cache
+    if [[ "$_buildtype" =~ ^(full|thin)$ ]]; then
+        echo "Enabling KBUILD_CFLAGS -O2..."
+        scripts/config -d CC_OPTIMIZE_FOR_PERFORMANCE_O3 -e CC_OPTIMIZE_FOR_PERFORMANCE -d CC_OPTIMIZE_FOR_SIZE
+    else
+        echo "Enabling KBUILD_CFLAGS -O3..."
+        scripts/config -e CC_OPTIMIZE_FOR_PERFORMANCE_O3 -d CC_OPTIMIZE_FOR_PERFORMANCE -d CC_OPTIMIZE_FOR_SIZE
+    fi
+
+    ### Enable bbr3
+    if [[ "$_tcp_bbr3" =~ ^(yes|y|1)$ ]]; then
+        echo "Disabling TCP_CONG_CUBIC..."
+        scripts/config \
+            -m TCP_CONG_CUBIC -d DEFAULT_CUBIC \
+            -e TCP_CONG_BBR -e DEFAULT_BBR \
+            --set-str DEFAULT_TCP_CONG bbr \
+            -m NET_SCH_FQ_CODEL \
+            -e NET_SCH_FQ \
+            -d CONFIG_DEFAULT_FQ_CODEL \
+            -e CONFIG_DEFAULT_FQ \
+            --set-str DEFAULT_NET_SCH "fq"
+    fi
+
+    ### Select THP
+    case "$_hugepage" in
+        always) scripts/config -d TRANSPARENT_HUGEPAGE_MADVISE -e TRANSPARENT_HUGEPAGE_ALWAYS;;
+        madvise) scripts/config -d TRANSPARENT_HUGEPAGE_ALWAYS -e TRANSPARENT_HUGEPAGE_MADVISE;;
+        *) _die "The _hugepage value '$_hugepage' is invalid. Choose the correct one again.";;
+    esac
+
+    echo "Selecting '$_hugepage' TRANSPARENT_HUGEPAGE config..."
+
+    ### Enable Handheld
+    if [[ "$build_handheld" -eq 1 ]]; then
+        echo "Enabling handheld configs..."
+        scripts/config \
+            -d RCU_LAZY_DEFAULT_OFF \
+            -e AMD_PRIVATE_COLOR \
+            -m MFD_STEAMDECK \
+            -m SENSORS_STEAMDECK \
+            -m SND_SOC_AW87XXX \
+            -m HID_ASUS_ALLY \
+            -m HID_LENOVO_GO \
+            -m HID_LENOVO_GO_S \
+            -m HID_MSI_CLAW \
+            -m ZOTAC_ZONE_HID \
+            -m LEDS_STEAMDECK \
+            -m LEDS_VALVE \
+            -e ACPI_CALL \
+            -m ZOTAC_ZONE_PLATFORM \
+            -m EXTCON_STEAMDECK \
+            -m HID_MSI
+    fi
+
+    ### Enable Clang AutoFDO
+    if [[ "$_autofdo" =~ ^(yes|y|1)$ ]]; then
+        scripts/config -e AUTOFDO_CLANG
+    fi
+    if [[ "$_autofdo" =~ ^(yes|y|1)$ && -n "$_autofdo_profile_name" ]]; then
+        echo "The AutoFDO profile has been found..."
+        BUILD_FLAGS+=(CLANG_AUTOFDO_PROFILE="${srcdir}/${_autofdo_profile_name}")
+    fi
+
+    ### Run the config.sh script for kernel tuning
+    if [[ -s "${srcdir}"/config.sh ]]; then
+        echo "Further kernel customization: Running config.sh script..."
+        bash "${srcdir}"/config.sh
+    fi
+
+    ### Optionally run the custom.sh script for custom tuning
+    if [ -n "$custom_script" ]; then
+        echo "Custom kernel tuning: Running custom.sh script..."
+        bash "$custom_script"
+    fi
+
+    ### Optionally load needed modules for the make localmodconfig
+    ### https://aur.archlinux.org/packages/modprobed-db
+    ### https://github.com/Frogging-Family/linux-tkg (minimal-modprobed.db)
+    if [[ "$_localmodcfg" =~ ^(yes|y|1)$ ]]; then
+        echo "Running Steven Rostedt's make localmodconfig now"
+
+        if [[ ! "$_localmodcfg_path" = "/"* ]]; then
+          if [[ -e "$HOME/.local/share/modprobed-db/$_localmodcfg_path" ]]; then
+            _localmodcfg_path="$HOME/.local/share/modprobed-db/$_localmodcfg_path"
+          else
+            _localmodcfg_path="$HOME/.config/$_localmodcfg_path"
+          fi
+        fi
+
+        [[ "$_localmodcfg_minimal" =~ ^(yes|y|1)$ ]] && \
+           echo "Including the modules in minimal-modprobed.db"
+
+        (
+           if [[ -e "$_localmodcfg_path" ]]; then
+              cat "$_localmodcfg_path"
+           else
+              # Fallback to listing currently loaded modules if the DB file
+              # is missing. E.g. modprobed-db not installed or package not
+              # available on non-Arch platforms.
+              lsmod | awk 'NR > 1 { print $1 }'
+           fi
+
+           if [[ "$_localmodcfg_minimal" =~ ^(yes|y|1)$ ]]; then
+              cat "${srcdir}"/minimal-modprobed.db
+           fi
+
+           # Include RAM disk, exfat, ntsync, ttm, and modules for Docker
+           # Include tcp_bbr, tcp_dctcp, and tcp_htcp for bpftune
+           for module in \
+              brd bridge exfat drm_ttm_helper llc irqbypass nf_conntrack \
+              nf_conntrack_netlink nf_defrag_ipv4 nf_defrag_ipv6 nf_nat \
+              nf_tables nft_chain_nat nft_compat ntsync overlay stp tcp_bbr \
+              tcp_dctcp tcp_htcp ttm tun veth xfrm_algo xfrm_user xt_addrtype \
+              xt_comment xt_conntrack xt_mark xt_MASQUERADE xt_nat xt_tcpudp \
+           ;do echo "$module"; done
+
+           # Include modules for Waydroid (Android in a Linux container)
+           for module in \
+              af_key inet_diag iptable_filter iptable_mangle iptable_nat \
+              iptable_raw nfnetlink_log nft_masq sch_ingress tcp_diag tunnel4 \
+              tunnel6 udp_diag vmw_vmci vmw_vsock_virtio_transport_common \
+              vmw_vsock_vmci_transport vsock vsock_loopback xfrm6_tunnel \
+              xfrm_interface xt_bpf xt_connmark xt_NFLOG xt_policy xt_state \
+              xt_TCPMSS xt_u32 \
+           ;do echo "$module"; done
+        ) | sort -u > "/tmp/modprobed.db.$$"
+
+        make "${BUILD_FLAGS[@]}" LSMOD="/tmp/modprobed.db.$$" localmodconfig
+        rm -f "/tmp/modprobed.db.$$"
+
+        # Re-apply the bbr3 module configs
+        if [[ "$_tcp_bbr3" =~ ^(yes|y|1)$ ]]; then
+           echo "Re-enabling the bbr3 module configs..."
+           scripts/config \
+              -m TCP_CONG_CUBIC -m NET_SCH_FQ_CODEL \
+              -d CONFIG_DEFAULT_FQ_CODEL \
+              -e CONFIG_DEFAULT_FQ
+        fi
+
+        # Re-apply the handheld module configs
+        if [ "$build_handheld" -eq 1 ]; then
+           echo "Re-enabling the handheld module configs..."
+           scripts/config \
+              -m MFD_STEAMDECK \
+              -m SENSORS_STEAMDECK \
+              -m SND_SOC_AW87XXX \
+              -m HID_ASUS_ALLY \
+              -m HID_LENOVO_GO \
+              -m HID_LENOVO_GO_S \
+              -m HID_MSI_CLAW \
+              -m ZOTAC_ZONE_HID \
+              -m LEDS_STEAMDECK \
+              -m LEDS_VALVE \
+              -m ZOTAC_ZONE_PLATFORM \
+              -m EXTCON_STEAMDECK \
+              -m HID_MSI
+        fi
+
+        # Re-run the custom.sh script to re-apply module configs
+        if [ -n "$custom_script" ]; then
+           echo "Re-running the custom.sh script to re-apply module configs..."
+           bash "$custom_script"
+        fi
+    fi
+
+    ### Rewrite configuration
+    echo -e "${_CYAN}Rewrite configuration...${_NC}"
+    make "${BUILD_FLAGS[@]}" -j3 prepare
+    yes "" | make "${BUILD_FLAGS[@]}" config >/dev/null
+
+    ### Prepared version
+    make "${BUILD_FLAGS[@]}" -s kernelrelease > version
+    echo "Prepared $pkgbase version $(<version)"
+
+    ### Running make nconfig
+    [[ "$_makenconfig" =~ ^(yes|y|1)$ ]] && make "${BUILD_FLAGS[@]}" nconfig
+
+    ### Running make xconfig
+    [[ "$_makexconfig" =~ ^(yes|y|1)$ ]] && make "${BUILD_FLAGS[@]}" xconfig
+
+    ### Save configuration for later reuse
+    echo -e "${_CYAN}Save configuration for later reuse...${_NC}"
+    local basedir="$(dirname "$(readlink "${srcdir}/config")")"
+    cat .config > "${basedir}/config-${pkgver}-${pkgrel}${pkgbase#linux}"
+}
+
+_sign_modules() {
+    msg2 "Signing modules in $1"
+    local sign_script="${srcdir}/${_srcname}/scripts/sign-file"
+    local sign_key="$(grep -Po 'CONFIG_MODULE_SIG_KEY="\K[^"]*' "${srcdir}/${_srcname}/.config")"
+    if [[ ! "$sign_key" =~ ^/ ]]; then
+        sign_key="${srcdir}/${_srcname}/${sign_key}"
+    fi
+    local sign_cert="${srcdir}/${_srcname}/certs/signing_key.x509"
+    local hash_algo="$(grep -Po 'CONFIG_MODULE_SIG_HASH="\K[^"]*' "${srcdir}/${_srcname}/.config")"
+
+    if [ "$buildtype" = "lto" ]; then
+        local strip_bin="llvm-strip"
+    else
+        local strip_bin="strip"
+    fi
+
+    find "$1" -type f -name '*.ko' -print \
+        -exec "${strip_bin}" --strip-debug '{}' \; \
+        -exec "${sign_script}" "${hash_algo}" "${sign_key}" "${sign_cert}" '{}' \;
+}
+
+build() {
+    cd "$_srcname"
+
+    ### Respect -jN flag in /etc/makepkg.conf
+    local ncpu=$(grep "^MAKEFLAGS=" "/etc/makepkg.conf" | sed "s/^.*-j\([0-9]*\).*/\1/")
+    local nproc=$(nproc)
+    [[ -z "$ncpu" || "$ncpu" = "MAKEFLAGS"* ]] && ncpu="$nproc"
+    [[ "$ncpu" -gt "$nproc" ]] && ncpu="$nproc"
+
+    ### Apply a localized throttle to prevent concurrent ThinLTO links from
+    ### over-saturating system resources and causing severe thread-thrashing.
+    if [[ "$_buildtype" = "thin" && "$ncpu" -ge 6 ]]; then
+        ncpu=$(awk -v j="$ncpu" 'BEGIN { print int(j * 0.8) }')
+    fi
+
+    ### Use grep to filter/silence harmless warnings
+    make "${BUILD_FLAGS[@]}" -j"$ncpu" all 2>&1 | \
+       grep -Ev '^  (AS|AR|CC|LD|BT|CE|CO|GE|HO|IN|IP|MK|OB|PA|PE|PO|RE|ST|TA|TE|UN|UP|VD|WR|X32)|: unexpected end of section|: unreachable instruction| missing __noreturn in | no .sframe will be created|: relocation to !ENDBR|ld: warning: orphan section|ld.lld: warning: .*is being placed in'
+
+    ### In the case compiling with a later LLVM release, use the
+    ### system toolchain for auto-detecting system features
+    env PATH="/usr/bin:$PATH" make -C tools/bpf/bpftool vmlinux.h feature-clang-bpf-co-re=1 | \
+       grep -Ev '^  (AS|AR|CC|LD|BT|CE|CO|GE|HO|IN|IP|MK|OB|PA|PE|PO|RE|ST|TA|TE|UN|UP|VD|WR|X32)'
+
+    local MODULE_FLAGS=(
+       KERNEL_UNAME="${_kernuname}"
+       IGNORE_PREEMPT_RT_PRESENCE=1
+       SYSSRC="${srcdir}/${_srcname}"
+       SYSOUT="${srcdir}/${_srcname}"
+    )
+
+    if [[ "$_build_r8125" =~ ^(yes|y|1)$ ]]; then
+        cd "${srcdir}/r8125"
+        make "${BUILD_FLAGS[@]}" KERNELDIR="$srcdir/$_srcname" modules
+    fi
+}
+
+_package() {
+    pkgdesc="The $pkgdesc kernel and modules"
+    depends=('coreutils' 'kmod' 'initramfs')
+    optdepends=('wireless-regdb: to set the correct wireless channels of your country'
+                'linux-firmware: firmware images needed for some devices'
+                'modprobed-db: Keeps track of EVERY kernel module that has ever been probed - useful for those of us who make localmodconfig'
+                'scx-scheds: to use sched-ext schedulers')
+    provides=(VIRTUALBOX-GUEST-MODULES WIREGUARD-MODULE KSMBD-MODULE V4L2LOOPBACK-MODULE NTSYNC-MODULE VHBA-MODULE ADIOS-MODULE)
+    install="cachymod.install"
+
+    cd "$_srcname"
+
+    local modulesdir="$pkgdir/usr/lib/modules/$(<version)"
+
+    echo "Installing boot image..."
+    # systemd expects to find the kernel here to allow hibernation
+    # https://github.com/systemd/systemd/commit/edda44605f06a41fb86b7ab8128dcf99161d2344
+    install -Dm644 "$(make "${BUILD_FLAGS[@]}" -s image_name)" "$modulesdir/vmlinuz"
+
+    # Used by mkinitcpio to name the kernel
+    echo "$pkgbase" | install -Dm644 /dev/stdin "$modulesdir/pkgbase"
+
+    echo "Installing modules..."
+    ZSTD_CLEVEL=6 make "${BUILD_FLAGS[@]}" INSTALL_MOD_PATH="$pkgdir/usr" INSTALL_MOD_STRIP=1 \
+        DEPMOD=/doesnt/exist modules_install  # Suppress depmod
+
+    # remove build links
+    rm "$modulesdir"/build
+}
+
+_package-headers() {
+    pkgdesc="Headers and scripts for building modules for the $pkgdesc kernel"
+    depends=(
+      binutils glibc libelf libgcc openssl
+      pahole xxhash zlib zstd "${pkgbase}"
+    )
+
+    if [[ "$buildtype" =~ (lto|clang) ]]; then
+        depends+=(clang llvm lld)
+    fi
+
+    cd "${_srcname}"
+    local builddir="$pkgdir/usr/lib/modules/$(<version)/build"
+
+    echo "Installing build files..."
+    install -Dt "$builddir" -m644 .config Makefile Module.symvers System.map \
+        localversion.* version vmlinux tools/bpf/bpftool/vmlinux.h
+    install -Dt "$builddir/kernel" -m644 kernel/Makefile
+    install -Dt "$builddir/arch/x86" -m644 arch/x86/Makefile
+    cp -t "$builddir" -a scripts
+    ln -srt "$builddir" "$builddir/scripts/gdb/vmlinux-gdb.py"
+
+    # required when STACK_VALIDATION is enabled
+    install -Dt "$builddir/tools/objtool" tools/objtool/objtool
+
+    # required when DEBUG_INFO_BTF_MODULES is enabled
+    if [ -f tools/bpf/resolve_btfids/resolve_btfids ]; then
+        install -Dt "$builddir/tools/bpf/resolve_btfids" tools/bpf/resolve_btfids/resolve_btfids
+    fi
+
+    echo "Installing headers..."
+    cp -t "$builddir" -a include
+    cp -t "$builddir/arch/x86" -a arch/x86/include
+    install -Dt "$builddir/arch/x86/kernel" -m644 arch/x86/kernel/asm-offsets.s
+
+    install -Dt "$builddir/drivers/md" -m644 drivers/md/*.h
+    install -Dt "$builddir/net/mac80211" -m644 net/mac80211/*.h
+
+    # https://bugs.archlinux.org/task/13146
+    install -Dt "$builddir/drivers/media/i2c" -m644 drivers/media/i2c/msp3400-driver.h
+
+    # https://bugs.archlinux.org/task/20402
+    install -Dt "$builddir/drivers/media/usb/dvb-usb" -m644 drivers/media/usb/dvb-usb/*.h
+    install -Dt "$builddir/drivers/media/dvb-frontends" -m644 drivers/media/dvb-frontends/*.h
+    install -Dt "$builddir/drivers/media/tuners" -m644 drivers/media/tuners/*.h
+
+    # https://bugs.archlinux.org/task/71392
+    install -Dt "$builddir/drivers/iio/common/hid-sensors" -m644 drivers/iio/common/hid-sensors/*.h
+
+    echo "Installing KConfig files..."
+    find . -name 'Kconfig*' -exec install -Dm644 {} "$builddir/{}" \;
+
+    # Install .rmeta files if they exist
+    if compgen -G "rust/*.rmeta" 1>/dev/null; then
+        install -Dt "$builddir/rust" -m644 rust/*.rmeta
+    fi
+
+    # Install .so files if they exist
+    if compgen -G "rust/*.so" 1>/dev/null; then
+        install -Dt "$builddir/rust" rust/*.so
+    fi
+
+    # Install generated Rust files
+    if [ -d rust/kernel ]; then
+        while IFS= read -r -d "" _gen; do
+            install -Dm644 "$_gen" "$builddir/$_gen"
+        done < <(find rust -type f -name 'generated_*.rs' -print0)
+    fi
+
+    echo "Installing unstripped VDSO..."
+    make INSTALL_MOD_PATH="$pkgdir/usr" vdso_install \
+        link=  # Suppress build-id symlinks
+
+    echo "Removing unneeded architectures..."
+    local arch
+    for arch in "$builddir"/arch/*/; do
+        [[ $arch = */x86/ ]] && continue
+        echo "Removing $(basename "$arch")"
+        rm -r "$arch"
+    done
+
+    echo "Removing documentation..."
+    rm -r "$builddir/Documentation"
+
+    echo "Removing broken symlinks..."
+    find -L "$builddir" -type l -printf 'Removing %P\n' -delete
+
+    echo "Removing loose objects..."
+    find "$builddir" -type f -name '*.o' -printf 'Removing %P\n' -delete
+
+    echo "Stripping build tools..."
+    local file strip="/usr/bin/strip"
+    while read -rd '' file; do
+        case "$(file -Sib "$file")" in
+            application/x-sharedlib\;*)      # Libraries (.so)
+                echo "$strip $STRIP_SHARED '${file#*build/}'"
+                $strip $STRIP_SHARED "$file" ;;
+            application/x-archive\;*)        # Libraries (.a)
+                echo "$strip $STRIP_STATIC '${file#*build/}'"
+                $strip $STRIP_STATIC "$file" ;;
+            application/x-executable\;*)     # Binaries
+                echo "$strip $STRIP_BINARIES '${file#*build/}'"
+                $strip $STRIP_BINARIES "$file" ;;
+            application/x-pie-executable\;*) # Relocatable binaries
+                echo "$strip $STRIP_SHARED '${file#*build/}'"
+                $strip $STRIP_SHARED "$file" ;;
+        esac
+    done < <(find "$builddir" -type f -perm -u+x ! -name vmlinux -print0)
+
+    echo "Stripping vmlinux..."
+    echo "$strip $STRIP_STATIC 'vmlinux'"
+    $strip $STRIP_STATIC "$builddir/vmlinux"
+
+    echo "Adding symlink..."
+    mkdir -p "$pkgdir/usr/src"
+    ln -sr "$builddir" "$pkgdir/usr/src/$pkgbase"
+}
+
+_package-dbg(){
+    pkgdesc="Non-stripped vmlinux file for the $pkgdesc kernel"
+    depends=("${pkgbase}-headers")
+
+    cd "${_srcname}"
+    mkdir -p "$pkgdir/usr/src/debug/${pkgbase}"
+    install -Dt "$pkgdir/usr/src/debug/${pkgbase}" -m644 vmlinux
+}
+
+_package-r8125() {
+    pkgdesc="r8125 modules for the $pkgbase kernel"
+    depends=("$pkgbase=$_kernver")
+    license=('GPL-2.0-only')
+
+    cd "$_srcname"
+    local modulesdir="$pkgdir/usr/lib/modules/$(<version)/extramodules"
+
+    cd "${srcdir}/r8125"
+    install -dm755 "${modulesdir}"
+    install -m644 src/*.ko "${modulesdir}"
+
+    _sign_modules "${modulesdir}"
+    find "$pkgdir" -name '*.ko' -exec zstd --rm -6 -T0 {} +
+
+    # Blacklist r8169 so that r8125 is used instead
+    install -dm755 "${pkgdir}/usr/lib/modprobe.d"
+    echo "install r8169 /usr/bin/modprobe r8125 || /usr/bin/modprobe --ignore-install r8169" > "${pkgdir}/usr/lib/modprobe.d/${pkgname}.conf"
+}
+
+pkgname=("$pkgbase")
+[[ "$_build_debug" =~ ^(yes|y|1)$ ]] && pkgname+=("$pkgbase-dbg")
+pkgname+=("$pkgbase-headers")
+[[ "$_build_r8125" =~ ^(yes|y|1)$ ]] && pkgname+=("$pkgbase-r8125")
+for _p in "${pkgname[@]}"; do
+    eval "package_$_p() {
+    $(declare -f "_package${_p#$pkgbase}")
+    _package${_p#$pkgbase}
+    }"
+done
+
+b2sums=('94fdbcabc2c6feefe585c1564a7398755201372f87e057aa83ec5e049dbb06c6f1bf8c7b044563693e35fb2e2b11bbd64c56997f9e8262cf0a9231e0ebe6cf57'
+        '0e65fe4833ee671bb451ba11f3b4a191c7dd6df920e7604d63fab04a41ce3d54edb01239ab634a00c429c1330c864e465a492d6dea8053793cd19cf5db00027d'
+        '2a1ad856cc9cdb9c6a8629353e5ee7a91ffb0205fb58685f7db69717af6af66a9c65799e1b44cedbb1ee5af3669cbdf6a8caf8d6dd87ce4bbc033698b7748b2a'
+        'fb50c26d4c22325a894447efc62dc40df6ce0df983fc35b53c7cb5d380defe5aec4bcdf61faf3c03d3295ea860e63137455c1201b59c47607812e7e2f231f2fc'
+        'e22523d255df907f46036236e2bb2de4f0300d55fa93f019121dd7ea908aea772e76d2dd31f18bc2aad0de285144b38214af6039c9d7edd887dea5aa3b252229'
+        'c7b52d99a885efed1375817c9eec861be04426488b0b907b66a5a24a4a75a8757ef1cec67057ad09638a2f7332f2abc541e747ff77e95a1e82c00ed1daa96b74'
+        'fb6fa4509899111ad5160d0d2b6741cf14029ac54412f175495b22d96666eafc386f3f77633f76267c891da1a9f80f2f321ede8f656b19db437d02d48ef499f2'
+        '456b2311859dca2c678ac7dc3678cd3bdf064a1ff5cf4ef69f893cfeef2bb28456a20d30fffb5ebce9e5f83102262b5bf614fe8df9eaaf177cf1fba7ce212c2e'
+        '50b830ff0e4f264daca08164e396031128ca73d65816293e9ee24bf2b51b8725a3fd437a69223e414f8c77952f17046a0f34e17560e26635e8abdfc55efd4122'
+        'cdb4a006894d898b4973f0298b13d77665ba058e71c719dcb3b4f43a015e3ceaca86f3e297db94f38f08396f1e978648c5a195986ee7a31a46b86d0a26956cc3'
+        '576f213a6c9d2ec1740bf819f8d0bea5a7fa32d03bafc78314856d443822b2d8455060bc167bda334d3eab7fea95c2166bd62fe3bca410dab313e11fb0794b44'
+        '2613c85bbbde582952e8eadcda8695010a6c1130e5e6f87592c443aeb425babafd5e4b8db06af1e50c626111f7f3001fc94e6e38e86cb45048eca89fdef69828'
+        '586d46aaa1cc777ed65454b93b5ed8f2a3e3999f4dc72caeb731b6c6d0516c2ea01e686d0cb2671b2af9d0474dec5591589fd079d0712c54cc9b58f8fac1918d'
+        '941b0f36171d5ffe13d6299178a1b6273902e40bcd61c2833a8ae5789b7b1a26e29b28c44dc69efeb037988e7d89abea63d6ff5ae35b41360496ba0669c495f6'
+        'd4b511a59fc17658016b9cc545b72959634764615c39d07fa7ffa3a2f5d527241eb03ce9510d091dba65149ddaa69708d0c5f60da86c73eaf2e51274aa0de0fb'
+        '7328de0c4b9af644419e9b85fd2b695d5896b9ed0d1549099cf4475115956d0a6d85ce1ab902fcfcc44eb3abadd5e087cd77b05a81366a7615a8e319c4d0a750'
+        'd28f1436c1fc80a6f37a413193ad6120db917f11c92100340d811dfeccf774e7241eaa7f38c8359be4c6229504b7902ce2dc4b53f2466827de2be7c63a05efec'
+        '71f7ae82681ecb15b04cda0ac24f732af932169f731c5e1be1ec6635835b7f4c20b38e467a938f701948542eebd4dab10505d71c672a0501cb903a7f6f26f1b9'
+        '2d5dbb948a77d46ed1935a1b2d181e4abe74f439f66c97c01389958a75937797ff76167042256c0a1d817ee3174bfb16a037774f727e9cab94315f37277e94a4'
+        '95c1b58c5a20ab91f8fdc5a62b0cb0b923004516cf39a1363dba8d45a6a276e1de0a227eb64adc6bd38b6f06c018bff3389ad7b987a9c7a0cc5cec035a546c78'
+        '3a388dcd6b613f644db05e2f85caf78e147c733a99fc04d7a2f022dfba955259689f4e43e441d19839eb22ff3786f5ff91d811ed34cf71297958baed732970a2'
+        '5a6f1f1cc801a95d1e396cc924f6d8a7bd5788544df1b6e26f405c9aec2e2b35eb47f947eb65777745208bc8dfa743b28c50a18950f7fc156d1232a426a29ac3'
+        'e58eafa35e488390cee324d4cadd029d64cb6ca4f32f715e6e25ebc06ccbaa369d5c5e38db5627e19cf49116c7201c92643fd332b1023560dcc12b618c234b11')

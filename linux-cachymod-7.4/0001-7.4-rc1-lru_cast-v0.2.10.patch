@@ -1035,6 +1035,7 @@ index b74bc1e501..8ecddcb09b 100644
  #include <linux/gfp.h>
  #include <linux/mm.h>
  #include <linux/swap.h>
+ #include <linux/mm_inline.h>
 +#include <linux/lru_cast.h>
  #include <linux/leafops.h>
  #include <linux/syscalls.h>
