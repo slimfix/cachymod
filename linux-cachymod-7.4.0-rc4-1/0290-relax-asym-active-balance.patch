@@ -1,0 +1,192 @@
+
+sched/fair: Relax non-SMT asym_active_balance() for pinned tasks
+
+When a task has a restricted CPU affinity mask (e.g., via taskset,
+sched_setaffinity(), or WINE_CPU_TOPOLOGY), higher-priority sched_groups
+in MC or DIE domains may contain idle CPUs excluded by the task's cpumask.
+In this case, asym_active_balance() repeatedly attempts stop-machine
+migrations across cores or LLCs despite affinity constraints, causing
+unnecessary migration overhead and performance degradation on multi-CCD
+and non-SMT systems.
+
+Additionally, unpinned latency-sensitive workloads such as games can
+experience mid-frame preemption spikes from active_load_balance_cpu_stop()
+when threads are pulled across cores or CCDs.
+
+Relax asymmetric active balancing outside of SMT domains
+!(sd->flags & SD_SHARE_CPUCAPACITY) in two ways:
+ - Automatically skip non-SMT asym_active_balance() whenever the running
+   task is restricted to a subset of online CPUs (nr_cpus_allowed less than
+   num_online_cpus()), including on non-SMT / SMT-disabled systems.
+ - Introduce a runtime sysctl knob (kernel.sched_relax_asym_enabled) that,
+   when enabled, skips non-SMT asym_active_balance() for all tasks
+   (including unpinned workloads), while preserving primary SMT sibling
+   preference.
+
+Runtime control (disabled by default):
+   kernel.sched_relax_asym_enabled = 0 (default: active for unpinned tasks)
+   kernel.sched_relax_asym_enabled = 1 (relax non-SMT active balance for all)
+
+Benchmark Results (algorithm3.pl prime sieve):
+   https://github.com/marioroy/mce-sandbox
+
+Patch series:
+   0270-deprioritize-smt-itmt
+   0280-prefer-idle-core
+   0290-relax-asym-active-balance (this patch)
+
+1. Multi-CCD: AMD Ryzen Threadripper 9960X (24C/48T, 4 CCDs)
+
+   Commands:
+      ./algorithm3.pl 1e12 --threads=20
+      taskset -c 0-23 ./algorithm3.pl 1e12 --threads=20
+      taskmod -d ./algorithm3.pl 1e12 --threads=20
+      ./algorithm3.pl 1e12 --threads=20 --procbind
+
+   Mode                         Default    Patched    Delta
+   ------------------------------------------------------------------
+   Unpinned                     15.133s    13.107s    -2.026s (-13.4%)
+   Pinned primary (taskset)     17.323s    12.567s    -4.756s (-27.5%)
+   Idle-core mode (taskmod -d)      --     12.421s        --
+   Per-core bound (--procbind)  12.391s    12.357s    -0.034s (-0.3%)
+
+2. Single-CCD: AMD Ryzen 7 9800X3D (8C/16T, 1 CCD)
+
+   Commands:
+      ./algorithm3.pl 5e11 --threads=5
+      taskset -c 0-7 ./algorithm3.pl 5e11 --threads=5
+      taskmod -d ./algorithm3.pl 5e11 --threads=5
+      ./algorithm3.pl 5e11 --threads=5 --procbind
+
+   Mode                         Default    Patched    Delta
+   ------------------------------------------------------------------
+   Unpinned                     27.354s    27.014s    -0.340s (-1.2%)
+   Pinned primary (taskset)     27.000s    26.467s    -0.533s (-2.0%)
+   Idle-core mode (taskmod -d)      --     26.422s        --
+   Per-core bound (--procbind)  26.345s    26.326s    -0.019s (-0.1%)
+
+On the 4-CCD Threadripper 9960X, pinning to primary physical siblings
+(taskset -c 0-23) previously suffered a +2.190s regression over unpinned
+execution (17.323s vs 15.133s) due to cross-CCD asym_active_balance()
+migration churn. With the patch series applied, pinned execution drops
+to 12.567s—eliminating the regression—and enabling idle-core preference
+(taskmod -d / kernel.sched_idlecore_enabled=1) reaches 12.421s,
+within 0.06s of strict 1:1 per-core binding (12.357s).
+
+Assisted-by: Gemini LLM
+Signed-off-by: Mario Roy <>
+
+diff -uNarp a/Documentation/admin-guide/sysctl/kernel.rst b/Documentation/admin-guide/sysctl/kernel.rst
+--- a/Documentation/admin-guide/sysctl/kernel.rst
++++ b/Documentation/admin-guide/sysctl/kernel.rst
+@@ -1288,6 +1288,21 @@ sched_idlecore_enabled
+ 
+ 1: Enabled.
+ 
++sched_relax_asym_enabled
++========================
++
++Relaxes asymmetric active load balancing outside of SMT sibling domains
++(``!(sd->flags & SD_SHARE_CPUCAPACITY)``) for all tasks.
++
++When enabled (1), the scheduler skips cross-core and cross-CCD asymmetric
++active migrations (``asym_active_balance()``) even for unpinned tasks,
++avoiding stop-machine preemption spikes while preserving primary SMT
++sibling preference and standard wakeup placement.
++
++0: Disabled (default; active for unpinned tasks, skipped for pinned tasks).
++
++1: Enabled.
++
+ sched_schedstats
+ ================
+ 
+diff -uNarp a/kernel/sched/fair.c b/kernel/sched/fair.c
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -13604,6 +13604,15 @@ asym_active_balance(struct lb_env *env)
+ 	    (sched_asym_prefer(env->dst_cpu, env->src_cpu) ||
+ 	    !sched_use_asym_prio(env->sd, env->src_cpu))) {
+ 
++		/*
++		 * When sched_relax_asym_enabled=1, skip cross-core and
++		 * cross-CCD asymmetric active load balancing for all tasks
++		 * while still allowing SMT sibling -> primary core rescue.
++		 */
++		if (sched_relax_asym_active() &&
++		    !(env->sd->flags & SD_SHARE_CPUCAPACITY))
++			return false;
++
+ 		/*
+ 		 * When idle-core preference is enabled on SMT systems, require
+ 		 * the destination physical core (all SMT siblings) to be
+@@ -13612,6 +13621,21 @@ asym_active_balance(struct lb_env *env)
+ 		if (sched_smt_active() && sched_idlecore_active())
+ 			return is_idle_core(env->dst_cpu);
+ 
++		/*
++		 * Do not trigger cross-core or cross-CCD asymmetric active load
++		 * balancing for tasks with restricted CPU affinity. When a task
++		 * is pinned to a subset of CPUs, higher-priority sched_groups can
++		 * appear to have idle capacity on CPUs excluded by the task's
++		 * cpumask, causing futile active balance attempts and unwanted
++		 * migrations across LLCs. Preserve SMT sibling preference.
++		 */
++		if (!(env->sd->flags & SD_SHARE_CPUCAPACITY)) {
++			struct task_struct *p = READ_ONCE(env->src_rq->curr);
++
++			if (p && p->nr_cpus_allowed < num_online_cpus())
++				return false;
++		}
++
+ 		return true;
+ 	}
+ 
+diff -uNarp a/kernel/sched/idlecore.c b/kernel/sched/idlecore.c
+--- a/kernel/sched/idlecore.c
++++ b/kernel/sched/idlecore.c
+@@ -8,6 +8,7 @@
+ #include "idlecore.h"
+ 
+ DEFINE_STATIC_KEY_FALSE(sched_idlecore_enabled);
++DEFINE_STATIC_KEY_FALSE(sched_relax_asym_enabled);
+ 
+ #ifdef CONFIG_SYSCTL
+ static const struct ctl_table sched_idlecore_sysctls[] = {
+@@ -18,6 +19,13 @@ static const struct ctl_table sched_idle
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_do_static_key,
+ 	},
++	{
++		.procname	= "sched_relax_asym_enabled",
++		.data		= &sched_relax_asym_enabled.key,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_do_static_key,
++	},
+ };
+ 
+ static int __init sched_idlecore_sysctl_init(void)
+diff -uNarp a/kernel/sched/idlecore.h b/kernel/sched/idlecore.h
+--- a/kernel/sched/idlecore.h
++++ b/kernel/sched/idlecore.h
+@@ -5,10 +5,16 @@
+ #include <linux/jump_label.h>
+ 
+ DECLARE_STATIC_KEY_FALSE(sched_idlecore_enabled);
++DECLARE_STATIC_KEY_FALSE(sched_relax_asym_enabled);
+ 
+ static inline bool sched_idlecore_active(void)
+ {
+ 	return static_branch_unlikely(&sched_idlecore_enabled);
+ }
+ 
++static inline bool sched_relax_asym_active(void)
++{
++	return static_branch_unlikely(&sched_relax_asym_enabled);
++}
++
+ #endif /* _KERNEL_SCHED_IDLECORE_H */
+-- 
+2.53.0
+

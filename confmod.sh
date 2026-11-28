@@ -70,6 +70,8 @@ new_conf() {
     echo ": \${_use_bore:=no}"
     echo ": \${_cpusched:=eevdf}"
     echo ": \${_buildtype:=clang}"
+    echo ": \${_autofdo:=no}"
+    echo ": \${_autofdo_profile_name:=cachymod.afdo}"
     echo ": \${_hugepage:=auto}"
     echo ": \${_kernel_suffix:=${conf// /-}}"
     echo ": \${_localmodcfg:=no}"
@@ -105,6 +107,8 @@ save_conf() {
     echo ": \${_use_bore:=${_use_bore}}"
     echo ": \${_cpusched:=${_cpusched}}"
     echo ": \${_buildtype:=${_buildtype}}"
+    echo ": \${_autofdo:=${_autofdo}}"
+    echo ": \${_autofdo_profile_name:=${_autofdo_profile_name}}"
     echo ": \${_hugepage:=${_hugepage}}"
     echo ": \${_kernel_suffix:=${_kernel_suffix}}"
     echo ": \${_localmodcfg:=${_localmodcfg}}"
@@ -255,6 +259,33 @@ input_buildtype() {
   choose $1 menu "Choose a build type:" "$selected" "$msg"
 }
 
+input_autofdo() {
+  local -n varref="$1"; local msg=
+  msg+="Opt-in to include the AutoFDO profile when building the kernel.\n"
+  msg+="Note: Some folks have reported lesser performance. (YMMV)\n"
+  msg+="This is ignored for the 'gcc' build type.\n"
+
+  confirm $1 "Build kernel with the AutoFDO profile?" "$msg"
+}
+
+input_autofdo_profile_name() {
+  local -n varref="$1"; local oldval="$varref" num="$2" msg= ans=
+  msg+="Enter the name for the AutoFDO profile?\n"
+  msg+="\n"
+  msg+="Enter 'blank' to clear the value or 'file' to choose a profile.\n"
+  msg+="The profile must reside in the same folder as the PKGBUILD file.\n"
+
+  input $1 "$msg" 1
+  if [ "$varref" = "file" ]; then
+    # gum version v0.17.0 file command displays incorrectly
+    # https://github.com/charmbracelet/gum/issues/969
+    ans=$(gum file . --padding="2 0" --height=$((LINES - 6)) --file)
+    [ $? -gt 1 ] && exit # received a signal e.g. Ctrl-C
+    [[ -z "$ans" || "$ans" = "no file selected" ]] && ans="$oldval"
+    varref="${ans##*/}" # basename
+  fi
+}
+
 input_hugepage() {
   local -n varref="$1"; local menu=() selected=
   menu+=("auto:    Default always for non-RT or madvise for RT")
@@ -402,7 +433,7 @@ input_preempt() {
 input_processor_opt() {
   local -n varref="$1"; local menu=() selected= msg=
   msg+="Refer to the config file for your processor UARCH string\n"
-  msg+="Example custom.sh line: scripts/config -d GENERIC_CPU -e MTIGERLAKE\n"
+  msg+="Example custom.sh line: scripts/config -d GENERIC_CPU -e MSKYLAKEX\n"
 
   menu+=("generic:    Build for generic x86-64")
   menu+=("generic_v1: Build for generic x86-64 v1; SSE2 baseline")
@@ -413,6 +444,7 @@ input_processor_opt() {
   menu+=("westmere:   Build for Intel Westmere; pre-AVX / SSE4.2")
   menu+=("haswell:    Build for Intel Haswell; AVX2 / FMA3")
   menu+=("skylake:    Build for Intel Skylake; AVX2 mainstream")
+  menu+=("tigerlake:  Build for Intel Tiger Lake; AVX-512")
   menu+=("raptorlake: Build for Intel Raptor Lake; AVX2 / Hybrid")
   menu+=("meteorlake: Build for Intel Meteor Lake; AVX2 / NPU")
   menu+=("k10:        Build for AMD K10; pre-AVX / SSE4A")
@@ -432,14 +464,15 @@ input_processor_opt() {
     westmere  ) selected="${menu[ 6]}" ;;
     haswell   ) selected="${menu[ 7]}" ;;
     skylake   ) selected="${menu[ 8]}" ;;
-    raptorlake) selected="${menu[ 9]}" ;;
-    meteorlake) selected="${menu[10]}" ;;
-    k10       ) selected="${menu[11]}" ;;
-    zen2      ) selected="${menu[12]}" ;;
-    zen3      ) selected="${menu[13]}" ;;
-    zen4      ) selected="${menu[14]}" ;;
-    zen5      ) selected="${menu[15]}" ;;
-    other     ) selected="${menu[16]}" ;;
+    tigerlake ) selected="${menu[ 9]}" ;;
+    raptorlake) selected="${menu[10]}" ;;
+    meteorlake) selected="${menu[11]}" ;;
+    k10       ) selected="${menu[12]}" ;;
+    zen2      ) selected="${menu[13]}" ;;
+    zen3      ) selected="${menu[14]}" ;;
+    zen4      ) selected="${menu[15]}" ;;
+    zen5      ) selected="${menu[16]}" ;;
+    other     ) selected="${menu[17]}" ;;
   esac
 
   choose $1 menu "Choose CPU compiler optimization:" "$selected" "$msg"
@@ -493,14 +526,26 @@ edit_conf() {
   local selected="Main menu"
 
   while true; do
-    local _use_bore= _cpusched= _buildtype= _hugepage= _kernel_suffix=
+    local _use_bore= _cpusched= _buildtype= _autofdo= _hugepage= _kernel_suffix=
     local _localmodcfg= _localmodcfg_path= _localmodcfg_minimal=
     local _makenconfig= _makexconfig= _tcp_bbr3= _HZ_ticks= _ticktype=
     local _preempt= _processor_opt= _prevent_avx2= _build_r8125= _build_debug=
     local _extra_patch_or_url0= _extra_patch_or_url1= _extra_patch_or_url2=
     local _extra_patch_or_url3= _extra_patch_or_url4= _extra_patch_or_url5=
     local _extra_patch_or_url6= _extra_patch_or_url7= _extra_patch_or_url8=
-    local _extra_patch_or_url9=
+    local _extra_patch_or_url9= _autofdo_profile_name=
+
+    # Add the _autofdo build option if missing - November 7, 2026
+    if ! grep -q '_autofdo:=' "$CONFIG_DIR/$conf.conf"; then
+      sed -i '/_buildtype:=/a\
+: ${_autofdo:=no}' "$CONFIG_DIR/$conf.conf"
+    fi
+
+    # Add the _autofdo_profile_name build option if missing - November 7, 2026
+    if ! grep -q '_autofdo_profile_name:=' "$CONFIG_DIR/$conf.conf"; then
+      sed -i '/_autofdo:=/a\
+: ${_autofdo_profile_name:=cachymod.afdo}' "$CONFIG_DIR/$conf.conf"
+    fi
 
     source "$CONFIG_DIR/$conf.conf"
 
@@ -573,6 +618,16 @@ edit_conf() {
         input_buildtype _buildtype
         selected=": \${_buildtype:=$_buildtype}"
         [ "$_buildtype" = "$oldval" ] && continue ;;
+
+      ': ${_autofdo:='*)
+        input_autofdo _autofdo
+        selected=": \${_autofdo:=$_autofdo}"
+        [ "$_autofdo" = "$oldval" ] && continue ;;
+
+      ': ${_autofdo_profile_name:='*)
+        input_autofdo_profile_name _autofdo_profile_name
+        selected=": \${_autofdo_profile_name:=$_autofdo_profile_name}"
+        [ "$_autofdo_profile_name" = "$oldval" ] && continue ;;
 
       ': ${_hugepage:='*)
         input_hugepage _hugepage

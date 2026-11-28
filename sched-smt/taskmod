@@ -1,0 +1,260 @@
+#!/bin/bash
+#
+# Multi-function wrapper script for CachyMod's prefer-idle-core and
+# relax-asym-active-balance scheduler features.
+#
+# Get/set sysctl options, or set+run command and restore prior values.
+# Optionally expands -c <cpu-list> (supporting start-end[:step]) into
+# WINE_CPU_TOPOLOGY and applies taskset -c when executing a command.
+#
+# Prerequisite: Add NOPASSWD entry to /etc/sudoers.d/90-taskmod file.
+#
+# Author: https://github.com/marioroy/cachymod
+# SPDX-License-Identifier: GPL-2.0
+
+kopt_idle="kernel.sched_idlecore_enabled"
+kopt_relax="kernel.sched_relax_asym_enabled"
+SYSCTL_BIN="/usr/bin/sysctl"
+SUDO_BIN="/usr/bin/sudo"
+TASKSET_BIN="/usr/bin/taskset"
+
+usage() {
+    echo "Synopsis: ${0##*/} [-d|--disable|-e|--enable] [-r|--relax-asym|-n|--no-relax-asym] [-c <cpu-list>] [--] [command [args]]"
+}
+
+expand_cpu_list() {
+    local list="$1"
+    local part start end step i joined
+    local -a cpus=()
+    local -A seen=()
+    local IFS=','
+
+    for part in $list; do
+        if [[ "$part" =~ ^([0-9]+)-([0-9]+)(:([0-9]+))?$ ]]; then
+            start=${BASH_REMATCH[1]}
+            end=${BASH_REMATCH[2]}
+            step=${BASH_REMATCH[4]:-1}
+            if (( start > end || step < 1 )); then
+                echo "Invalid CPU range: $part" >&2
+                return 1
+            fi
+            for (( i=start; i<=end; i+=step )); do
+                if [ -z "${seen[$i]}" ]; then
+                    seen[$i]=1
+                    cpus+=("$i")
+                fi
+            done
+        elif [[ "$part" =~ ^[0-9]+$ ]]; then
+            if [ -z "${seen[$part]}" ]; then
+                seen[$part]=1
+                cpus+=("$part")
+            fi
+        else
+            echo "Invalid CPU specification: $part" >&2
+            return 1
+        fi
+    done
+
+    if (( ${#cpus[@]} == 0 )); then
+        echo "Empty CPU list" >&2
+        return 1
+    fi
+
+    joined=$(IFS=','; echo "${cpus[*]}")
+    echo "${#cpus[@]}:${joined}"
+}
+
+val_idle=
+val_relax=
+cpu_list=
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --disable)
+            # Prefer full idle physical cores
+            val_idle=1
+            shift
+            ;;
+        --enable)
+            # Prefer SMT siblings / mainline EEVDF
+            val_idle=0
+            shift
+            ;;
+        --relax-asym)
+            # Skip non-SMT asymmetric active balancing for all tasks
+            val_relax=1
+            shift
+            ;;
+        --no-relax-asym)
+            # Restore default non-SMT asymmetric active balancing
+            val_relax=0
+            shift
+            ;;
+        --cpu-list)
+            # Set command's CPU affinity
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Option $1 requires a CPU list (e.g., 0-5,24-29)" >&2
+                exit 1
+            fi
+            cpu_list="$2"
+            shift 2
+            ;;
+        --help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        --*)
+            usage
+            exit 0
+            ;;
+        -[dernc]*)
+            cluster="${1#-}"
+            shift
+            while [ -n "$cluster" ]; do
+                opt="${cluster:0:1}"
+                cluster="${cluster:1}"
+                case "$opt" in
+                    d) val_idle=1 ;;
+                    e) val_idle=0 ;;
+                    r) val_relax=1 ;;
+                    n) val_relax=0 ;;
+                    c)
+                        if [ -n "$cluster" ]; then
+                            cpu_list="$cluster"
+                            cluster=""
+                        elif [[ -n "$1" && "$1" != -* ]]; then
+                            cpu_list="$1"
+                            shift
+                        else
+                            echo "Option -c requires a CPU list (e.g., 0-5,24-29)" >&2
+                            exit 1
+                        fi
+                        ;;
+                    *)
+                        usage
+                        exit 0
+                        ;;
+                esac
+            done
+            ;;
+        -*)
+            usage
+            exit 0
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+wine_topo=
+expanded_cpus=
+
+if [ -n "$cpu_list" ]; then
+    wine_topo=$(expand_cpu_list "$cpu_list") || exit 1
+    expanded_cpus="${wine_topo#*:}"
+    export WINE_CPU_TOPOLOGY="$wine_topo"
+fi
+
+run_cmd() {
+    if [ -n "$expanded_cpus" ]; then
+        "$TASKSET_BIN" -c "$expanded_cpus" "$@"
+    else
+        "$@"
+    fi
+}
+
+curr_idle=$($SYSCTL_BIN -e $kopt_idle 2>/dev/null)
+curr_idle=${curr_idle##* }
+
+curr_relax=$($SYSCTL_BIN -e $kopt_relax 2>/dev/null)
+curr_relax=${curr_relax##* }
+
+if [ -z "$1" ]; then
+    # Display or set kernel options (and preview WINE_CPU_TOPOLOGY if -c was given)
+    if [ -n "$wine_topo" ]; then
+        echo "WINE_CPU_TOPOLOGY=$wine_topo"
+        [[ -z "$val_idle" && -z "$val_relax" ]] && exit 0
+    fi
+
+    if [[ -z "$curr_idle" && -z "$curr_relax" ]]; then
+        echo "$kopt_idle does not exist" >&2
+        exit 1
+    fi
+
+    # Status display when no toggle flags were passed
+    if [[ -z "$val_idle" && -z "$val_relax" ]]; then
+        if [ -n "$curr_idle" ]; then
+            if [ "$curr_idle" = "0" ]; then
+                echo "Prefer SMT siblings / mainline EEVDF"
+            else
+                echo "Prefer full idle physical cores"
+            fi
+            $SYSCTL_BIN $kopt_idle
+        fi
+        if [ -n "$curr_relax" ]; then
+            if [ "$curr_relax" = "0" ]; then
+                echo "Asymmetric active balance: enabled (unpinned tasks)"
+            else
+                echo "Asymmetric active balance: relaxed (all tasks)"
+            fi
+            $SYSCTL_BIN $kopt_relax
+        fi
+        exit 0
+    fi
+
+    # Set kernel options
+    if [ -n "$val_idle" ]; then
+        if [ -z "$curr_idle" ]; then
+            echo "$kopt_idle does not exist" >&2
+            exit 1
+        fi
+        if [ "$val_idle" = "0" ]; then
+            echo "Prefer SMT siblings / mainline EEVDF"
+        else
+            echo "Prefer full idle physical cores"
+        fi
+        $SUDO_BIN $SYSCTL_BIN $kopt_idle=$val_idle
+    fi
+
+    if [ -n "$val_relax" ]; then
+        if [ -z "$curr_relax" ]; then
+            echo "$kopt_relax does not exist" >&2
+            exit 1
+        fi
+        if [ "$val_relax" = "0" ]; then
+            echo "Asymmetric active balance: enabled (unpinned tasks)"
+        else
+            echo "Asymmetric active balance: relaxed (all tasks)"
+        fi
+        $SUDO_BIN $SYSCTL_BIN $kopt_relax=$val_relax
+    fi
+else
+    # Set requested options, execute command, and restore prior values on exit
+    restore_cmds=()
+
+    if [ -n "$curr_idle" ]; then
+        [ -z "$val_idle" ] && val_idle=0  # default: enable SMT siblings
+        if [ "$curr_idle" != "$val_idle" ]; then
+            restore_cmds+=("$SUDO_BIN $SYSCTL_BIN $kopt_idle=$curr_idle &>/dev/null")
+            $SUDO_BIN $SYSCTL_BIN $kopt_idle=$val_idle &>/dev/null
+        fi
+    fi
+    if [[ -n "$curr_relax" && -n "$val_relax" ]]; then
+        if [ "$curr_relax" != "$val_relax" ]; then
+            restore_cmds+=("$SUDO_BIN $SYSCTL_BIN $kopt_relax=$curr_relax &>/dev/null")
+            $SUDO_BIN $SYSCTL_BIN $kopt_relax=$val_relax &>/dev/null
+        fi
+    fi
+
+    if (( ${#restore_cmds[@]} > 0 )); then
+        trap "$(IFS='; '; echo "${restore_cmds[*]}")" EXIT
+    fi
+
+    run_cmd "$@"
+fi
+

@@ -1,0 +1,205 @@
+
+sched/fair: Add optional idle-core wakeup and asym balance checks
+
+Introduce an is_idle_core() helper using available_idle_cpu()
+across cpu_smt_mask() to verify that an entire physical core
+(all SMT siblings) is idle.
+
+When enabled via sysctl on SMT-active systems:
+ - In select_task_rq_fair() on wakeup (WF_TTWU), retain prev_cpu
+   if permitted by the task's affinity mask and its entire physical
+   core is idle.
+ - In asym_active_balance(), require the destination core to be
+   completely idle (is_idle_core(env->dst_cpu)) before performing
+   an asymmetric active migration.
+
+This preserves L1/L2 cache locality and prevents SMT execution-unit
+contention during wakeups and asymmetric packing for latency- and
+throughput-sensitive workloads such as gaming, without altering
+default EEVDF behavior when disabled.
+
+Runtime control (disabled by default):
+   kernel.sched_idlecore_enabled = 0 (default: OFF, mainline EEVDF)
+   kernel.sched_idlecore_enabled = 1 (ON, prefer idle physical cores)
+
+Credits & Acknowledgements:
+   Shubhang Kaushik (sched/fair: Prefer cache-hot prev_cpu for wakeup)
+   Andrea Righi (is_idle_core() helper)
+
+Assisted-by: Gemini LLM
+Signed-off-by: Mario Roy <>
+
+diff -uNarp a/Documentation/admin-guide/sysctl/kernel.rst b/Documentation/admin-guide/sysctl/kernel.rst
+--- a/Documentation/admin-guide/sysctl/kernel.rst
++++ b/Documentation/admin-guide/sysctl/kernel.rst
+@@ -1267,6 +1267,27 @@ Documentation/accounting/delay-accountin
+ a small amount of overhead in the scheduler but is useful for debugging
+ and performance tuning. It is required by some tools such as iotop.
+ 
++sched_idlecore_enabled
++======================
++
++Enables idle-core wakeup retention and asymmetric active-balance checks on
++SMT-capable systems.
++
++When enabled (1) and SMT is active, the scheduler:
++
++- Retains ``prev_cpu`` on task wakeup (``WF_TTWU``) if it is allowed by the
++  task's CPU affinity mask and all SMT siblings on its physical core are
++  currently idle.
++- Requires all SMT siblings on the destination physical core to be idle
++  before performing asymmetric active load balancing.
++
++This preserves L1/L2 cache locality and avoids SMT execution-unit contention
++for latency- and throughput-sensitive workloads such as gaming.
++
++0: Disabled (default, standard EEVDF behavior).
++
++1: Enabled.
++
+ sched_schedstats
+ ================
+ 
+diff -uNarp a/kernel/sched/fair.c b/kernel/sched/fair.c
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -2351,6 +2351,25 @@ update_stats_curr_start(struct cfs_rq *c
+ 	se->exec_start = rq_clock_task(rq_of(cfs_rq));
+ }
+ 
++#include "idlecore.h"
++
++/*
++ * Check sched_smt_active before calling this to avoid overheads in fastpaths.
++ * Unlike is_core_idle()—which skips @cpu assuming the caller already verified
++ * it is idle—this checks all SMT siblings including @cpu itself using
++ * available_idle_cpu() (accounting for vCPU preemption).
++ */
++static inline bool is_idle_core(int cpu)
++{
++	int sibling;
++
++	for_each_cpu(sibling, cpu_smt_mask(cpu))
++		if (!available_idle_cpu(sibling))
++			return false;
++
++	return true;
++}
++
+ /* Check sched_smt_active before calling this to avoid overheads in fastpaths */
+ static inline bool is_core_idle(int cpu)
+ {
+@@ -9980,8 +9999,20 @@ select_task_rq_fair(struct task_struct *
+ 	}
+ 
+ 	/* Fast path */
+-	if (wake_flags & WF_TTWU)
++	if (wake_flags & WF_TTWU) {
++		/*
++		 * If the previous smt-CPU is an idle core and allowed by the
++		 * task's affinity mask, retain it for cache locality.
++		 */
++		if (sched_smt_active() && sched_idlecore_active() &&
++		    cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
++		    is_idle_core(prev_cpu)) {
++
++			return prev_cpu;
++		}
++
+ 		return select_idle_sibling(p, prev_cpu, new_cpu);
++	}
+ 
+ 	return new_cpu;
+ }
+@@ -13569,9 +13600,22 @@ asym_active_balance(struct lb_env *env)
+ 	 * the lower priority @env::dst_cpu help it. Do not follow
+ 	 * CPU priority.
+ 	 */
+-	return env->idle && sched_use_asym_prio(env->sd, env->dst_cpu) &&
+-	       (sched_asym_prefer(env->dst_cpu, env->src_cpu) ||
+-		!sched_use_asym_prio(env->sd, env->src_cpu));
++	if (env->idle && sched_use_asym_prio(env->sd, env->dst_cpu) &&
++	    (sched_asym_prefer(env->dst_cpu, env->src_cpu) ||
++	    !sched_use_asym_prio(env->sd, env->src_cpu))) {
++
++		/*
++		 * When idle-core preference is enabled on SMT systems, require
++		 * the destination physical core (all SMT siblings) to be
++		 * completely idle before performing an asymmetric active pull.
++		 */
++		if (sched_smt_active() && sched_idlecore_active())
++			return is_idle_core(env->dst_cpu);
++
++		return true;
++	}
++
++	return false;
+ }
+ 
+ static inline bool
+diff -uNarp a/kernel/sched/idlecore.c b/kernel/sched/idlecore.c
+--- a/kernel/sched/idlecore.c
++++ b/kernel/sched/idlecore.c
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * Prefer idle-core scheduling implementation:
++ */
++
++#include <linux/sysctl.h>
++#include "idlecore.h"
++
++DEFINE_STATIC_KEY_FALSE(sched_idlecore_enabled);
++
++#ifdef CONFIG_SYSCTL
++static const struct ctl_table sched_idlecore_sysctls[] = {
++	{
++		.procname	= "sched_idlecore_enabled",
++		.data		= &sched_idlecore_enabled.key,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_do_static_key,
++	},
++};
++
++static int __init sched_idlecore_sysctl_init(void)
++{
++	register_sysctl_init("kernel", sched_idlecore_sysctls);
++	return 0;
++}
++late_initcall(sched_idlecore_sysctl_init);
++
++#endif /* CONFIG_SYSCTL */
+diff -uNarp a/kernel/sched/idlecore.h b/kernel/sched/idlecore.h
+--- a/kernel/sched/idlecore.h
++++ b/kernel/sched/idlecore.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _KERNEL_SCHED_IDLECORE_H
++#define _KERNEL_SCHED_IDLECORE_H
++
++#include <linux/jump_label.h>
++
++DECLARE_STATIC_KEY_FALSE(sched_idlecore_enabled);
++
++static inline bool sched_idlecore_active(void)
++{
++	return static_branch_unlikely(&sched_idlecore_enabled);
++}
++
++#endif /* _KERNEL_SCHED_IDLECORE_H */
+diff -uNarp a/kernel/sched/Makefile b/kernel/sched/Makefile
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -36,6 +36,7 @@ endif
+ # These compilation units have roughly the same size and complexity - so their
+ # build parallelizes well and finishes roughly at once:
+ #
++obj-y += idlecore.o
+ obj-y += core.o
+ obj-y += fair.o
+ obj-y += build_policy.o
+-- 
+2.53.0
+

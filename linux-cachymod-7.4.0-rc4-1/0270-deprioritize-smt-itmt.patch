@@ -1,0 +1,124 @@
+
+cpufreq: Deprioritize secondary SMT siblings in ITMT core rankings
+
+By default, CPPC and HWP firmware report identical highest_perf rankings
+for both SMT siblings of the same physical core. Override the ranking
+passed to sched_set_itmt_core_prio() in both amd-pstate and intel_pstate
+so that the secondary SMT sibling (any CPU not first in its sibling
+cpumask) subtracts 42 from the priority of its primary sibling.
+
+An offset of 42 provides an effective balance across modern AMD and
+Intel topologies:
+
+ Topology               Primary Range   SMT Range (-42)   Effect
+ -----------------------------------------------------------------------
+ Single-CCD AMD         196 .. 166      154 .. 124        All physical
+ (Ryzen 7 9800X3D)                                        cores first
+
+ Multi-CCD AMD          241 .. 166      199 .. 124        Intra-CCD SMT
+ (Threadripper 9960X)                                     sep + L3 local
+
+ Intel Hybrid           P: ~55..80      P-SMT: ~13..38    P > E > P-SMT
+ (HWP / CPPC scale)     E: ~40..50      (No E-core SMT)   above floor 1
+
+ - Single-CCD AMD: Firmware rankings span ~30 points across physical
+   cores (196 down to 166). Subtracting 42 places the top SMT sibling
+   (154) cleanly below the lowest physical core (166).
+
+ - Multi-CCD AMD: Firmware rankings span ~75 points across dies (241
+   down to 166). Subtracting 42 separates primary threads from SMT
+   siblings within each CCD while keeping the fastest CCD's SMT siblings
+   (199) above cold, lower-binned CCDs (166) to preserve L3 locality.
+
+ - Intel Hybrid: Places P-core SMT siblings below idle physical E-cores
+   while keeping primary P-cores at the top, remaining safely above the
+   minimum floor of 1 on both CPPC (0-255) and raw HWP ratio scales.
+
+In intel_pstate_set_itmt_prio(), move the sched_set_itmt_core_prio()
+call after the 0xff overclocking fallback and SMT adjustment so the
+scheduler receives the adjusted priority value and properly triggers
+ITMT support when core rankings otherwise tie.
+
+Assisted-by: Gemini LLM
+Signed-off-by: Mario Roy <>
+
+diff -uarp a/drivers/cpufreq/amd-pstate.c b/drivers/cpufreq/amd-pstate.c
+--- a/drivers/cpufreq/amd-pstate.c
++++ b/drivers/cpufreq/amd-pstate.c
+@@ -957,6 +957,15 @@ static void amd_perf_ctl_reset(unsigned int cpu)
+ 
+ #define CPPC_MAX_PERF	U8_MAX
+ 
++static int amd_pstate_smt_prio(int prio, unsigned int cpu)
++{
++	/* Deprioritize the secondary SMT sibling. */
++	if (cpu != cpumask_first(topology_sibling_cpumask(cpu)))
++		return max(1, prio - 42);
++
++	return prio;
++}
++
+ static void amd_pstate_init_prefcore(struct amd_cpudata *cpudata)
+ {
+ 	/* user disabled or not detected */
+@@ -973,7 +982,8 @@ static void amd_pstate_init_prefcore(struct amd_cpudata *cpudata)
+ 	cpudata->hw_prefcore = true;
+ 
+ 	/* Priorities must be initialized before ITMT support can be toggled on. */
+-	sched_set_itmt_core_prio((int)READ_ONCE(cpudata->prefcore_ranking), cpudata->cpu);
++	sched_set_itmt_core_prio(amd_pstate_smt_prio((int)READ_ONCE(cpudata->prefcore_ranking),
++				 cpudata->cpu), cpudata->cpu);
+ }
+ 
+ bool amd_pstate_cas_active(void)
+@@ -1055,8 +1065,11 @@ static void amd_pstate_update_limits(struct cpufreq_policy *policy)
+ 		WRITE_ONCE(cpudata->prefcore_ranking, cur_high);
+ 
+ 		if (cur_high < CPPC_MAX_PERF) {
+-			sched_set_itmt_core_prio((int)cur_high, cpu);
+-			sched_update_asym_prefer_cpu(cpu, prev_high, cur_high);
++			int adj_cur = amd_pstate_smt_prio((int)cur_high, cpu);
++			int adj_prev = amd_pstate_smt_prio((int)prev_high, cpu);
++
++			sched_set_itmt_core_prio(adj_cur, cpu);
++			sched_update_asym_prefer_cpu(cpu, adj_prev, adj_cur);
+ 		}
+ 	}
+ }
+diff -uarp a/drivers/cpufreq/intel_pstate.c b/drivers/cpufreq/intel_pstate.c
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@ -376,12 +376,6 @@ static void intel_pstate_set_itmt_prio(int cpu)
+ 	if (ret || cppc_perf.highest_perf == CPPC_MAX_PERF)
+ 		cppc_perf.highest_perf = HWP_HIGHEST_PERF(READ_ONCE(all_cpu_data[cpu]->hwp_cap_cached));
+ 
+-	/*
+-	 * The priorities can be set regardless of whether or not
+-	 * sched_set_itmt_support(true) has been called and it is valid to
+-	 * update them at any time after it has been called.
+-	 */
+-	sched_set_itmt_core_prio(cppc_perf.highest_perf, cpu);
+ 	/*
+ 	 * On some systems with overclocking enabled, CPPC.highest_perf is hardcoded to 0xff.
+ 	 * In this case we can't use CPPC.highest_perf to enable ITMT.
+@@ -390,6 +384,17 @@ static void intel_pstate_set_itmt_prio(int cpu)
+ 	if (cppc_perf.highest_perf == 0xff)
+ 		cppc_perf.highest_perf = HWP_HIGHEST_PERF(READ_ONCE(all_cpu_data[cpu]->hwp_cap_cached));
+ 
++	/* Deprioritize the secondary SMT sibling. */
++	if (cpu != cpumask_first(topology_sibling_cpumask(cpu)))
++		cppc_perf.highest_perf = max_t(int, 1, (int)cppc_perf.highest_perf - 42);
++
++	/*
++	 * The priorities can be set regardless of whether or not
++	 * sched_set_itmt_support(true) has been called and it is valid to
++	 * update them at any time after it has been called.
++	 */
++	sched_set_itmt_core_prio(cppc_perf.highest_perf, cpu);
++
+ 	if (max_highest_perf <= min_highest_perf) {
+ 		if (cppc_perf.highest_perf > max_highest_perf)
+ 			max_highest_perf = cppc_perf.highest_perf;
+-- 
+2.53.0
+

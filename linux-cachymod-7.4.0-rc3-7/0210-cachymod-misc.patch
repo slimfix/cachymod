@@ -620,45 +620,4 @@ https://github.com/CachyOS/linux/commit/ff4cf904d132b8
 Sync CACHY: drop unused modulo scheduling
 https://github.com/CachyOS/linux/commit/773080018867bfeff124768090ea991a6e070cd2
 
-diff --git a/Makefile b/Makefile
-index 2f74bb00be6551..6a512a4d45d28f 100644
---- a/Makefile
-+++ b/Makefile
-@@ -946,12 +946,6 @@ KBUILD_CFLAGS += -Os
- KBUILD_RUSTFLAGS += -Copt-level=s
- endif
- 
--# Perform swing modulo scheduling immediately before the first scheduling pass.
--# This pass looks at innermost loops and reorders their instructions by
--# overlapping different iterations.
--KBUILD_CFLAGS += $(call cc-option,-fmodulo-sched -fmodulo-sched-allow-regmoves -fivopts)
--KBUILD_CFLAGS += $(call cc-option,-mllvm -enable-pipeliner)
--
- # Always set `debug-assertions` and `overflow-checks` because their default
- # depends on `opt-level` and `debug-assertions`, respectively.
- KBUILD_RUSTFLAGS += -Cdebug-assertions=$(if $(CONFIG_RUST_DEBUG_ASSERTIONS),y,n)
--- 
-2.53.0
-
-Sync CACHY: kbuild: revert resolve_btfids from PKGBUILD
-https://github.com/CachyOS/linux/commit/9b3640276f8dd187487aa2c4e9bc8ecc338df7b1
-
-diff --git a/scripts/package/PKGBUILD b/scripts/package/PKGBUILD
-index e187908d3f1e6a..66e4b6a37783c2 100644
---- a/scripts/package/PKGBUILD
-+++ b/scripts/package/PKGBUILD
-@@ -90,11 +90,6 @@ _package-headers() {
- 		"${srctree}/scripts/package/install-extmod-build" "${builddir}"
- 	fi
- 
--	# required when DEBUG_INFO_BTF_MODULES is enabled
--	if [ -f tools/bpf/resolve_btfids/resolve_btfids ]; then
--		install -Dt "$builddir/tools/bpf/resolve_btfids" tools/bpf/resolve_btfids/resolve_btfids
--	fi
--
- 	echo "Installing System.map and config..."
- 	mkdir -p "${builddir}"
- 	cp System.map "${builddir}/System.map"
--- 
-2.53.0
 

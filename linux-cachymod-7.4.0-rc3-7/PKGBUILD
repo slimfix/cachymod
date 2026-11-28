@@ -17,7 +17,7 @@
 # E.g. { blank value, 74, 74-rt }
 # Or set to "auto" for automatic suffix { gcc, clang, lto }
 # Or set to blank value for no kernel suffix
-: ${_kernel_suffix:=}
+: ${_kernel_suffix:=slim}
 
 # Prevent AVX2 floating-point instructions. (Clear and XanMod default)
 : ${_prevent_avx2:=no}
@@ -198,7 +198,6 @@ source=(
     "0110-rt-lift-thp-restriction.patch"
     "0200-clearlinux-extras.patch"
     "0210-cachymod-misc.patch"
-    "0230-nap-0.6.6.patch"
     "0260-fair-update-cachy-mods.patch"
     "0290-7.4-rc1-poc-selector-v3.0.1.patch"
 
@@ -338,6 +337,10 @@ prepare() {
         fi
         if [[ $src = *-revert-cachy-mods.patch ]]; then
             [[ "$build_bore" -eq 0 ]] && continue
+        fi
+        if [[ "$src" == *adios-v4* || "$src" == "0001-6.18.3-adios-v4.0.0-rc1.patch" ]]; then
+            rm -f block/adios.c block/*.orig block/*.rej
+            sed -i '/obj-\$(CONFIG_MQ_IOSCHED_ADIOS)[[:space:]]*+=[[:space:]]*adios\.o/d' block/Makefile
         fi
         echo -e "${_CYAN}Applying patch $src...${_NC}"
         patch -Np1 < "../$src"
@@ -733,7 +736,7 @@ _package() {
         DEPMOD=/doesnt/exist modules_install  # Suppress depmod
 
     # remove build links
-    rm "$modulesdir"/build
+    rm -f "$modulesdir"/build
 }
 
 _package-headers() {
@@ -907,7 +910,6 @@ b2sums=('94fdbcabc2c6feefe585c1564a7398755201372f87e057aa83ec5e049dbb06c6f1bf8c7
         '576f213a6c9d2ec1740bf819f8d0bea5a7fa32d03bafc78314856d443822b2d8455060bc167bda334d3eab7fea95c2166bd62fe3bca410dab313e11fb0794b44'
         '2613c85bbbde582952e8eadcda8695010a6c1130e5e6f87592c443aeb425babafd5e4b8db06af1e50c626111f7f3001fc94e6e38e86cb45048eca89fdef69828'
         '586d46aaa1cc777ed65454b93b5ed8f2a3e3999f4dc72caeb731b6c6d0516c2ea01e686d0cb2671b2af9d0474dec5591589fd079d0712c54cc9b58f8fac1918d'
-        '822462a7572d134841f550990e4c7eabe0ff00b9342f1e8e4f8898082d9c1e3a2b59ffc9f69136eeb4dafc3531eb2e29cc65cda6f37d4564418c7f3ce732d9f0'
         '941b0f36171d5ffe13d6299178a1b6273902e40bcd61c2833a8ae5789b7b1a26e29b28c44dc69efeb037988e7d89abea63d6ff5ae35b41360496ba0669c495f6'
         '7328de0c4b9af644419e9b85fd2b695d5896b9ed0d1549099cf4475115956d0a6d85ce1ab902fcfcc44eb3abadd5e087cd77b05a81366a7615a8e319c4d0a750'
         '2d5dbb948a77d46ed1935a1b2d181e4abe74f439f66c97c01389958a75937797ff76167042256c0a1d817ee3174bfb16a037774f727e9cab94315f37277e94a4'
